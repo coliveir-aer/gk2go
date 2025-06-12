@@ -134,7 +134,7 @@ class Gk2aDataFetcher:
                 
                 c1_planck = 2 * h * c_light**2
                 c2_planck = (h * c_light) / k
-                radiance_per_meter = radiance * 1e6
+                radiance_per_meter = radiance
                 term_in_log = (c1_planck / (radiance_per_meter * (lambda_c**5))) + 1.0
                 teff = c2_planck / (lambda_c * np.log(term_in_log))
 
