@@ -89,11 +89,11 @@ class Gk2aDataFetcher:
             print(f"\n[DEBUG] Raw 'DN_to_Radiance_Gain' attribute info:")
             print(f"  - Type: {type(gain_attr)}")
             print(f"  - Value: {repr(gain_attr)}")
-            
+
             print(f"\n[DEBUG] Raw 'DN_to_Radiance_Offset' attribute info:")
             print(f"  - Type: {type(offset_attr)}")
             print(f"  - Value: {repr(offset_attr)}")
-            
+
             def get_scalar(attr_name):
                 val = ds.attrs[attr_name]
                 print(f"  [get_scalar] Initial value for '{attr_name}': {repr(val)} (type: {type(val)})")
@@ -102,6 +102,7 @@ class Gk2aDataFetcher:
                         raise ValueError(f"Calibration coefficient {attr_name} is an empty sequence.")
                     val = val[0]
                     print(f"  [get_scalar] Unwrapped to: {repr(val)} (type: {type(val)})")
+                # Cast to float to handle cases where metadata gives a string (e.g., '10.5')
                 return float(val)
 
             gain = get_scalar('DN_to_Radiance_Gain')
@@ -113,9 +114,9 @@ class Gk2aDataFetcher:
 
             print("\n[DEBUG] Attempting multiplication: radiance = dn_variable * gain + offset")
             radiance = dn_variable * gain + offset
-            radiance.attrs['units'] = 'W m-2 sr-1 um-1'
+            radiance.attrs['units'] = 'W m-2 sr-1 um-1' # Note: This is radiance per-micrometer
             print("[DEBUG] DN to Radiance conversion successful.")
-            
+
             # --- Channel-Specific Calibration ---
             channel_type = product_name[:2]
 
@@ -125,33 +126,42 @@ class Gk2aDataFetcher:
                 albedo.attrs['long_name'] = 'Albedo'
                 albedo.attrs['units'] = '%'
                 ds['albedo'] = albedo
-                
+
             elif channel_type in ['sw', 'ir', 'wv']:
-                # The Planck function is only defined for positive radiance. Where the linear
-                # calibration produces non-physical (negative or zero) radiance, we must
-                # treat it as invalid data (NaN) to prevent a math error.
+                # The Planck function is only defined for positive radiance.
+                # Where the linear calibration produces non-physical (negative or zero) radiance,
+                # we must treat it as invalid data (NaN) to prevent a math error.
                 positive_radiance = radiance.where(radiance > 0)
 
-                # The radiance MUST be converted from 'per-micrometer' to 'per-meter' (SI unit)
+                # Radiance MUST be converted from 'per-micrometer' to 'per-meter' (SI unit)
                 # for the Planck formula to work with SI constants. This multiplication is correct.
                 radiance_per_meter = positive_radiance * 1e6
 
-                h = get_scalar('Plank_constant_h')
-                k = get_scalar('Boltzmann_constant_k')
-                c_light = get_scalar('light_speed')
-                lambda_c = get_scalar('channel_center_wavelength') * 1e-6 # This is also correct
+                # ==================================================================
+                # ### FIXED SECTION ###
+                #
+                # DO NOT recalculate the Planck constants from the file's metadata.
+                # The correction coefficients are based on a standard, fixed set of constants.
+                # Using the slightly different constants from the file attributes breaks
+                # the subsequent Teff -> Tbb polynomial correction.
+                #
+                # These are the standard effective constants for GOES-R/Himawari/GK2A.
+                c1_planck = 1.191042953e-16  # W m^2 sr^-1
+                c2_planck = 1.4387774e-2    # K m
+                #
+                # ==================================================================
 
-                c1_planck = 2 * h * c_light**2
-                c2_planck = (h * c_light) / k
+                lambda_c = get_scalar('channel_center_wavelength') * 1e-6 # Wavelength to meters
 
-                # Perform the calculation using the clean, correctly-scaled radiance
+                # Inverse Planck function to get Effective Temperature (Teff)
                 term_in_log = (c1_planck / (radiance_per_meter * (lambda_c**5))) + 1.0
                 teff = c2_planck / (lambda_c * np.log(term_in_log))
 
+                # This is a standard polynomial correction to get Brightness Temperature (Tbb)
                 c0 = get_scalar('Teff_to_Tbb_c0')
                 c1_t = get_scalar('Teff_to_Tbb_c1')
                 c2_t = get_scalar('Teff_to_Tbb_c2')
-                
+
                 tbb = c2_t * teff**2 + c1_t * teff + c0
                 tbb.attrs['long_name'] = 'Brightness Temperature'
                 tbb.attrs['units'] = 'K'
