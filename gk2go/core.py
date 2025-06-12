@@ -130,7 +130,7 @@ class Gk2aDataFetcher:
                 h = get_scalar('Plank_constant_h')
                 k = get_scalar('Boltzmann_constant_k')
                 c_light = get_scalar('light_speed')
-                lambda_c = get_scalar('channel_center_wavelength') * 1e-6
+                lambda_c = get_scalar('channel_center_wavelength')
                 
                 c1_planck = 2 * h * c_light**2
                 c2_planck = (h * c_light) / k
