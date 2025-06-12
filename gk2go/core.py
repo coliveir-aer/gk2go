@@ -74,11 +74,11 @@ class Gk2aDataFetcher:
         print(f"Calibrating data for {product_name}...")
         try:
             # --- Robustly get calibration coefficients ---
-            # Some files store these as 1-element arrays, so we extract the scalar value.
+            # This helper function handles metadata attributes that might be single
+            # values, lists, or numpy arrays, and returns a single scalar float.
             def get_scalar(value):
-                if hasattr(value, '__iter__') and not isinstance(value, str):
-                    return value[0]
-                return value
+                # Convert to a numpy array, then extract the single item.
+                return np.array(value).item()
 
             # --- Common Step: DN to Radiance ---
             gain = get_scalar(ds.attrs['DN_to_Radiance_Gain'])
