@@ -70,28 +70,19 @@ class Gk2aDataFetcher:
     def _calibrate(self, ds, product_name):
         """
         Calibrates the raw data in the dataset to scientific units.
-        This now correctly handles polynomial coefficients for conversions.
         """
         print(f"Calibrating data for {product_name}...")
         try:
-            # --- Robustly get calibration coefficients as a list ---
-            def get_coeffs(value):
-                arr = np.array(value, ndmin=1)
-                return arr.tolist()
-
-            # --- Apply a polynomial using the coefficients ---
-            def apply_poly(data, coeffs):
-                # coeffs are typically [c0, c1, c2, ...], apply with numpy's polyval
-                # Note: polyval expects coefficients in decreasing order of power,
-                # so we reverse the list.
-                p = np.poly1d(coeffs[::-1])
-                return p(data)
+            # --- Robustly get calibration coefficients as scalars ---
+            # This forces the attribute to a numpy array and uses .item()
+            # to extract the single scalar value. This is the standard way
+            # to handle attributes that might be scalars, lists, or arrays.
+            def get_scalar(attr_name):
+                return np.asarray(ds.attrs[attr_name]).item()
 
             # --- Common Step: DN to Radiance ---
-            # The docs suggest this is a linear conversion (gain/offset), which is a
-            # 1st-degree polynomial. We'll handle it generically.
-            gain = get_coeffs(ds.attrs['DN_to_Radiance_Gain'])[0]
-            offset = get_coeffs(ds.attrs['DN_to_Radiance_Offset'])[0]
+            gain = get_scalar('DN_to_Radiance_Gain')
+            offset = get_scalar('DN_to_Radiance_Offset')
             radiance = ds['image_pixel_values'] * gain + offset
             radiance.attrs['units'] = 'W m-2 sr-1 um-1'
             
@@ -99,7 +90,7 @@ class Gk2aDataFetcher:
             channel_type = product_name[:2]
 
             if channel_type in ['vi', 'nr']: # Visible & Near-IR -> Albedo
-                c = get_coeffs(ds.attrs['Radiance_to_Albedo_c'])[0]
+                c = get_scalar('Radiance_to_Albedo_c')
                 albedo = radiance * c * 100 # Convert to percentage
                 albedo.attrs['long_name'] = 'Albedo'
                 albedo.attrs['units'] = '%'
@@ -107,10 +98,10 @@ class Gk2aDataFetcher:
                 
             elif channel_type in ['sw', 'ir', 'wv']: # IR/WV -> Brightness Temp
                 # --- Radiance to Effective Temperature (Teff) ---
-                h = get_coeffs(ds.attrs['Plank_constant_h'])[0]
-                k = get_coeffs(ds.attrs['Boltzmann_constant_k'])[0]
-                c_light = get_coeffs(ds.attrs['light_speed'])[0]
-                lambda_c = get_coeffs(ds.attrs['channel_center_wavelength'])[0] * 1e-6
+                h = get_scalar('Plank_constant_h')
+                k = get_scalar('Boltzmann_constant_k')
+                c_light = get_scalar('light_speed')
+                lambda_c = get_scalar('channel_center_wavelength') * 1e-6
                 
                 c1_planck = 2 * h * c_light**2
                 c2_planck = (h * c_light) / k
@@ -118,10 +109,9 @@ class Gk2aDataFetcher:
                 teff = (c2_planck * wavenumber_m) / np.log(1 + (c1_planck * wavenumber_m**3) / radiance)
 
                 # --- Effective Temperature (Teff) to Brightness Temperature (Tbb) ---
-                # Here we apply a polynomial with potentially multiple coefficients
-                c0 = get_coeffs(ds.attrs['Teff_to_Tbb_c0'])[0]
-                c1_t = get_coeffs(ds.attrs['Teff_to_Tbb_c1'])[0]
-                c2_t = get_coeffs(ds.attrs['Teff_to_Tbb_c2'])[0]
+                c0 = get_scalar('Teff_to_Tbb_c0')
+                c1_t = get_scalar('Teff_to_Tbb_c1')
+                c2_t = get_scalar('Teff_to_Tbb_c2')
                 
                 tbb = c2_t * teff**2 + c1_t * teff + c0
                 tbb.attrs['long_name'] = 'Brightness Temperature'
