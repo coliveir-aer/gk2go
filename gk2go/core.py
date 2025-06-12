@@ -73,9 +73,16 @@ class Gk2aDataFetcher:
         """
         print(f"Calibrating data for {product_name}...")
         try:
+            # --- Robustly get calibration coefficients ---
+            # Some files store these as 1-element arrays, so we extract the scalar value.
+            def get_scalar(value):
+                if hasattr(value, '__iter__') and not isinstance(value, str):
+                    return value[0]
+                return value
+
             # --- Common Step: DN to Radiance ---
-            gain = ds.attrs['DN_to_Radiance_Gain']
-            offset = ds.attrs['DN_to_Radiance_Offset']
+            gain = get_scalar(ds.attrs['DN_to_Radiance_Gain'])
+            offset = get_scalar(ds.attrs['DN_to_Radiance_Offset'])
             radiance = ds['image_pixel_values'] * gain + offset
             radiance.attrs['units'] = 'W m-2 sr-1 um-1'
             
@@ -83,7 +90,7 @@ class Gk2aDataFetcher:
             channel_type = product_name[:2]
 
             if channel_type in ['vi', 'nr']: # Visible & Near-IR -> Albedo
-                c = ds.attrs['Radiance_to_Albedo_c']
+                c = get_scalar(ds.attrs['Radiance_to_Albedo_c'])
                 albedo = radiance * c * 100 # Convert to percentage
                 albedo.attrs['long_name'] = 'Albedo'
                 albedo.attrs['units'] = '%'
@@ -91,24 +98,22 @@ class Gk2aDataFetcher:
                 
             elif channel_type in ['sw', 'ir', 'wv']: # IR/WV -> Brightness Temp
                 # --- Radiance to Effective Temperature (Teff) ---
-                h = ds.attrs['Plank_constant_h']
-                k = ds.attrs['Boltzmann_constant_k']
-                c = ds.attrs['light_speed']
-                # Central wavelength in meters
-                lambda_c = ds.attrs['channel_center_wavelength'] * 1e-6
+                h = get_scalar(ds.attrs['Plank_constant_h'])
+                k = get_scalar(ds.attrs['Boltzmann_constant_k'])
+                c = get_scalar(ds.attrs['light_speed'])
+                lambda_c = get_scalar(ds.attrs['channel_center_wavelength']) * 1e-6
                 
-                c1 = 2 * h * c**2
-                c2 = (h * c) / k
+                c1_planck = 2 * h * c**2
+                c2_planck = (h * c) / k
                 
-                # Wavenumber in cm-1, then convert to m-1
                 wavenumber_m = (1 / lambda_c)
                 
-                teff = (c2 * wavenumber_m) / np.log(1 + (c1 * wavenumber_m**3) / radiance)
+                teff = (c2_planck * wavenumber_m) / np.log(1 + (c1_planck * wavenumber_m**3) / radiance)
 
                 # --- Effective Temperature (Teff) to Brightness Temperature (Tbb) ---
-                c0 = ds.attrs['Teff_to_Tbb_c0']
-                c1_t = ds.attrs['Teff_to_Tbb_c1']
-                c2_t = ds.attrs['Teff_to_Tbb_c2']
+                c0 = get_scalar(ds.attrs['Teff_to_Tbb_c0'])
+                c1_t = get_scalar(ds.attrs['Teff_to_Tbb_c1'])
+                c2_t = get_scalar(ds.attrs['Teff_to_Tbb_c2'])
                 
                 tbb = c2_t * teff**2 + c1_t * teff + c0
                 tbb.attrs['long_name'] = 'Brightness Temperature'
