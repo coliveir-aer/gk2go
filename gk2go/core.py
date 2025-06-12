@@ -73,27 +73,8 @@ class Gk2aDataFetcher:
         Calibrates the raw data in the dataset to scientific units.
         """
         print(f"--- Entering Calibration for {product_name} ---")
-        
-        # --- Extensive Debugging Prints ---
-        dn_variable = ds['image_pixel_values']
-        gain_attr = ds.attrs.get('DN_to_Radiance_Gain', 'N/A')
-        offset_attr = ds.attrs.get('DN_to_Radiance_Offset', 'N/A')
-
-        print(f"\n[DEBUG] Raw 'image_pixel_values' info:")
-        print(f"  - Type: {type(dn_variable)}")
-        print(f"  - Shape: {dn_variable.shape}")
-        print(f"  - Dtype: {dn_variable.dtype}")
-        print(f"  - Underlying data type: {type(dn_variable.data)}")
-
-        print(f"\n[DEBUG] Raw 'DN_to_Radiance_Gain' attribute info:")
-        print(f"  - Type: {type(gain_attr)}")
-        print(f"  - Value: {repr(gain_attr)}")
-        
-        print(f"\n[DEBUG] Raw 'DN_to_Radiance_Offset' attribute info:")
-        print(f"  - Type: {type(offset_attr)}")
-        print(f"  - Value: {repr(offset_attr)}")
-        
         try:
+            # --- Definitive helper to get a scalar value ---
             def get_scalar(attr_name):
                 val = ds.attrs[attr_name]
                 print(f"  [get_scalar] Initial value for '{attr_name}': {repr(val)} (type: {type(val)})")
@@ -106,19 +87,20 @@ class Gk2aDataFetcher:
 
             gain = get_scalar('DN_to_Radiance_Gain')
             offset = get_scalar('DN_to_Radiance_Offset')
-
-            print("\n[DEBUG] Processed scalar coefficients:")
-            print(f"  - Gain: {gain} (type: {type(gain)})")
-            print(f"  - Offset: {offset} (type: {type(offset)})")
-
-            print("\n[DEBUG] Attempting multiplication: radiance = dn_variable * gain + offset")
-            # This is the line that has been failing.
-            radiance = dn_variable * gain + offset
-            radiance.attrs['units'] = 'W m-2 sr-1 um-1'
+            
+            # Operate on the raw dask/numpy array to avoid potential xarray overhead issues
+            dn_array = ds['image_pixel_values'].data
+            radiance_array = dn_array * gain + offset
+            
+            radiance = xr.DataArray(
+                radiance_array,
+                coords=ds['image_pixel_values'].coords,
+                dims=ds['image_pixel_values'].dims,
+                attrs={'units': 'W m-2 sr-1 um-1'}
+            )
             print("[DEBUG] DN to Radiance conversion successful.")
             
             # --- Channel-Specific Calibration ---
-            # (Code continues as before, but will only be reached if the above succeeds)
             channel_type = product_name[:2]
 
             if channel_type in ['vi', 'nr']:
@@ -200,19 +182,32 @@ class Gk2aDataFetcher:
             return None
 
     def get_data(self, sensor, product, area, query_type='latest', target_time=None, start_time=None, end_time=None, calibrate=False):
+        print(f"\n--- Entering get_data for product: {product}, query: {query_type} ---")
+        
         if query_type == 'latest':
             search_end = datetime.utcnow()
             search_start = search_end - timedelta(hours=2)
             found_files = self._find_files(sensor, product, search_start, search_end, area)
-            if not found_files: return None
+            if not found_files: 
+                print("[INFO] No files found for 'latest' query.")
+                return None
             
             latest_file = found_files[-1]
-            ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{latest_file['s3_key']}")
-            if not ds: return None
+            print(f"[DEBUG] Latest file found: {latest_file['s3_key']}")
             
+            print("[DEBUG] Calling _load_as_xarray...")
+            ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{latest_file['s3_key']}")
+            
+            if not ds: 
+                print("[ERROR] _load_as_xarray returned None.")
+                return None
+            
+            print(f"[DEBUG] Dataset loaded. Calibrate flag is: {calibrate}")
             if calibrate:
+                print("[DEBUG] Entering _calibrate function call...")
                 ds = self._calibrate(ds, product)
-
+            
+            print("[DEBUG] Expanding dims and returning dataset.")
             return ds.expand_dims(time=[latest_file['datetime']])
 
         elif query_type == 'nearest':
