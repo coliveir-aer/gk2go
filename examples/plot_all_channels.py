@@ -4,14 +4,14 @@
 """
 Example: Plot All GK2A Channels (Calibrated)
 
-This script demonstrates how to use the `gk2go` library to fetch the
-latest full disk image for all 16 AMI channels, calibrate them to
-scientific units (Albedo or Brightness Temperature), and display them
-in a 4x4 grid with appropriate color scaling.
+This script demonstrates how to use the `gk2go` library to fetch a
+full disk image nearest to noon over Korea from yesterday for all 16
+AMI channels, calibrate them to scientific units (Albedo or Brightness Temperature),
+and display them in a 4x4 grid with appropriate color scaling.
 """
 
 import matplotlib.pyplot as plt
-from datetime import datetime
+from datetime import datetime, timedelta, time # Import time for precise time setting
 import numpy as np
 import sys
 
@@ -84,18 +84,32 @@ def main():
         'wv069', 'wv073', 'ir087', 'ir096', 'ir105', 'ir112', 'ir123', 'ir133'
     ]
 
+    # --- Define target time for yesterday's noon over Korea ---
+    # Get yesterday's date in UTC
+    yesterday_utc_date = (datetime.utcnow() - timedelta(days=1)).date()
+    # Noon KST is 03:00 UTC (KST = UTC + 9 hours)
+    target_time_utc = datetime.combine(yesterday_utc_date, time(3, 0))
+
+    # Set the area back to Full Disk ('fd')
+    target_area = 'fd'
+
     # Set up the 4x4 plot
     fig, axes = plt.subplots(4, 4, figsize=(16, 18))
     axes = axes.flatten()
-    fig.suptitle('Latest Calibrated GK2A Full Disk Images by Channel', fontsize=20, y=0.98)
+    fig.suptitle(f'Calibrated GK2A Full Disk Images Nearest to {target_time_utc.strftime("%Y-%m-%d %H:%M UTC")}', fontsize=16, y=0.98)
 
     # Loop through channels and plot
     for i, channel in enumerate(ami_channels):
         print(f"\n--- Processing Channel: {channel} ---")
         ax = axes[i]
-        # Request calibrated data
+        # Request calibrated data nearest to the target time and over the specified area
         ds = fetcher.get_data(
-            sensor='ami', product=channel, area='fd', query_type='latest', calibrate=True
+            sensor='ami',
+            product=channel,
+            area=target_area,         # Set back to 'fd' for Full Disk
+            query_type='nearest',      # Request nearest scene
+            target_time=target_time_utc, # Specify the target time
+            calibrate=True
         )
         if ds:
             plot_calibrated_data(fig, ds, ax, title=channel.upper())
@@ -103,7 +117,7 @@ def main():
             ax.text(0.5, 0.5, 'No Data Found', ha='center', va='center', color='red')
             ax.set_title(channel.upper(), fontsize=10)
             ax.set_xticks([]); ax.set_yticks([])
-    
+            
     # Finalize and show the plot
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
