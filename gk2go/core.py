@@ -74,24 +74,7 @@ class Gk2aDataFetcher:
         """
         print(f"--- Entering Calibration for {product_name} ---")
         try:
-            # --- Extensive Debugging Prints ---
-            dn_variable = ds['image_pixel_values']
-            gain_attr = ds.attrs['DN_to_Radiance_Gain']
-            offset_attr = ds.attrs['DN_to_Radiance_Offset']
-
-            print(f"\n[DEBUG] Raw 'image_pixel_values' info:")
-            print(f"  - Type: {type(dn_variable)}")
-            print(f"  - Shape: {dn_variable.shape}")
-            print(f"  - Dtype: {dn_variable.dtype}")
-            
-            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Gain' attribute info:")
-            print(f"  - Type: {type(gain_attr)}")
-            print(f"  - Value: {gain_attr}")
-            
-            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Offset' attribute info:")
-            print(f"  - Type: {type(offset_attr)}")
-            print(f"  - Value: {offset_attr}")
-            
+            # --- Definitive helper to get a scalar value ---
             def get_scalar(attr_name):
                 val = ds.attrs[attr_name]
                 while isinstance(val, (list, tuple, np.ndarray)):
@@ -100,29 +83,34 @@ class Gk2aDataFetcher:
                     val = val[0]
                 return float(val)
 
+            # --- Common Step: DN to Radiance ---
             gain = get_scalar('DN_to_Radiance_Gain')
             offset = get_scalar('DN_to_Radiance_Offset')
 
-            print("\n[DEBUG] Processed scalar coefficients:")
-            print(f"  - Gain: {gain} (type: {type(gain)})")
-            print(f"  - Offset: {offset} (type: {type(offset)})")
-
-            print("\n[DEBUG] Attempting multiplication: radiance = dn * gain + offset")
-            radiance = dn_variable * gain + offset
-            radiance.attrs['units'] = 'W m-2 sr-1 um-1'
+            # Operate on the raw dask/numpy array, not the xarray object, to avoid type errors.
+            dn_array = ds['image_pixel_values'].data
+            radiance_array = dn_array * gain + offset
+            
+            # Create a new xarray.DataArray for the result
+            radiance = xr.DataArray(
+                radiance_array,
+                coords=ds['image_pixel_values'].coords,
+                dims=ds['image_pixel_values'].dims,
+                attrs={'units': 'W m-2 sr-1 um-1'}
+            )
             print("[DEBUG] DN to Radiance conversion successful.")
             
             # --- Channel-Specific Calibration ---
             channel_type = product_name[:2]
 
-            if channel_type in ['vi', 'nr']:
+            if channel_type in ['vi', 'nr']: # Visible & Near-IR -> Albedo
                 c = get_scalar('Radiance_to_Albedo_c')
                 albedo = radiance * c * 100
                 albedo.attrs['long_name'] = 'Albedo'
                 albedo.attrs['units'] = '%'
                 ds['albedo'] = albedo
                 
-            elif channel_type in ['sw', 'ir', 'wv']:
+            elif channel_type in ['sw', 'ir', 'wv']: # IR/WV -> Brightness Temp
                 h = get_scalar('Plank_constant_h')
                 k = get_scalar('Boltzmann_constant_k')
                 c_light = get_scalar('light_speed')
