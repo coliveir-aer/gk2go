@@ -11,6 +11,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from botocore import UNSIGNED
 from dateutil.parser import parse as parse_date
+import numpy as np
 
 class GK2ADefs:
     AMI_FILENAME_RE = re.compile(
@@ -66,6 +67,62 @@ class Gk2aDataFetcher:
     def __init__(self):
         self.s3_utils = S3Utils()
 
+    def _calibrate(self, ds, product_name):
+        """
+        Calibrates the raw data in the dataset to scientific units.
+        """
+        print(f"Calibrating data for {product_name}...")
+        try:
+            # --- Common Step: DN to Radiance ---
+            gain = ds.attrs['DN_to_Radiance_Gain']
+            offset = ds.attrs['DN_to_Radiance_Offset']
+            radiance = ds['image_pixel_values'] * gain + offset
+            radiance.attrs['units'] = 'W m-2 sr-1 um-1'
+            
+            # --- Channel-Specific Calibration ---
+            channel_type = product_name[:2]
+
+            if channel_type in ['vi', 'nr']: # Visible & Near-IR -> Albedo
+                c = ds.attrs['Radiance_to_Albedo_c']
+                albedo = radiance * c * 100 # Convert to percentage
+                albedo.attrs['long_name'] = 'Albedo'
+                albedo.attrs['units'] = '%'
+                ds['albedo'] = albedo
+                
+            elif channel_type in ['sw', 'ir', 'wv']: # IR/WV -> Brightness Temp
+                # --- Radiance to Effective Temperature (Teff) ---
+                h = ds.attrs['Plank_constant_h']
+                k = ds.attrs['Boltzmann_constant_k']
+                c = ds.attrs['light_speed']
+                # Central wavelength in meters
+                lambda_c = ds.attrs['channel_center_wavelength'] * 1e-6
+                
+                c1 = 2 * h * c**2
+                c2 = (h * c) / k
+                
+                # Wavenumber in cm-1, then convert to m-1
+                wavenumber_m = (1 / lambda_c)
+                
+                teff = (c2 * wavenumber_m) / np.log(1 + (c1 * wavenumber_m**3) / radiance)
+
+                # --- Effective Temperature (Teff) to Brightness Temperature (Tbb) ---
+                c0 = ds.attrs['Teff_to_Tbb_c0']
+                c1_t = ds.attrs['Teff_to_Tbb_c1']
+                c2_t = ds.attrs['Teff_to_Tbb_c2']
+                
+                tbb = c2_t * teff**2 + c1_t * teff + c0
+                tbb.attrs['long_name'] = 'Brightness Temperature'
+                tbb.attrs['units'] = 'K'
+                ds['brightness_temperature'] = tbb
+
+            print(f"Calibration successful.")
+            return ds
+
+        except Exception as e:
+            print(f"WARNING: Could not calibrate dataset for {product_name}. Returning uncalibrated data. Error: {e}", file=sys.stderr)
+            return ds # Return original dataset on failure
+
+
     @staticmethod
     def _generate_s3_prefixes(sensor, product, start_time, end_time, area=None):
         if not area:
@@ -104,7 +161,7 @@ class Gk2aDataFetcher:
             print(f"ERROR: Could not open S3 object {s3_path} as xarray.Dataset: {e}", file=sys.stderr)
             return None
 
-    def get_data(self, sensor, product, area, query_type='latest', target_time=None, start_time=None, end_time=None):
+    def get_data(self, sensor, product, area, query_type='latest', target_time=None, start_time=None, end_time=None, calibrate=False):
         if query_type == 'latest':
             search_end = datetime.utcnow()
             search_start = search_end - timedelta(hours=2)
@@ -113,7 +170,12 @@ class Gk2aDataFetcher:
             
             latest_file = found_files[-1]
             ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{latest_file['s3_key']}")
-            return ds.expand_dims(time=[latest_file['datetime']]) if ds else None
+            if not ds: return None
+            
+            if calibrate:
+                ds = self._calibrate(ds, product)
+
+            return ds.expand_dims(time=[latest_file['datetime']])
 
         elif query_type == 'nearest':
             if not target_time: raise ValueError("`target_time` is required for 'nearest' query.")
@@ -124,7 +186,12 @@ class Gk2aDataFetcher:
 
             nearest_file = min(found_files, key=lambda x: abs(x['datetime'] - target_time))
             ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{nearest_file['s3_key']}")
-            return ds.expand_dims(time=[nearest_file['datetime']]) if ds else None
+            if not ds: return None
+            
+            if calibrate:
+                ds = self._calibrate(ds, product)
+
+            return ds.expand_dims(time=[nearest_file['datetime']])
 
         elif query_type == 'range':
             if not start_time or not end_time: raise ValueError("`start_time` and `end_time` are required for 'range' query.")
@@ -136,8 +203,10 @@ class Gk2aDataFetcher:
                 ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{file_info['s3_key']}")
                 if ds:
                     main_var = next(iter(ds.data_vars))
-                    ds = ds[[main_var]]
-                    datasets.append(ds.expand_dims(time=[file_info['datetime']]))
+                    ds_clean = ds[[main_var]]
+                    if calibrate:
+                        ds_clean = self._calibrate(ds, product)
+                    datasets.append(ds_clean.expand_dims(time=[file_info['datetime']]))
             
             if not datasets: return None
             return xr.concat(datasets, dim='time')
