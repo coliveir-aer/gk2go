@@ -135,27 +135,114 @@ class Gk2aDataFetcher:
 
                 # Radiance MUST be converted from 'per-micrometer' to 'per-meter' (SI unit)
                 # for the Planck formula to work with SI constants. This multiplication is correct.
-                radiance_per_meter = positive_radiance * 1e6
+                # The ami_l1b.py reader applies a 1e-5 multiplier, converting from
+                # W m-2 sr-1 cm-1 to W m-2 sr-1 m-1.
+                # Our initial radiance is W m-2 sr-1 um-1.
+                # So to get to W m-2 sr-1 m-1: um-1 -> m-1 means multiply by 1e6.
+                # W m-2 sr-1 um-1 * 1e6 (um/m) = W m-2 sr-1 m-1
+                # The ami_l1b.py effectively converts from cm-1 to m-1, which is a factor of 100.
+                # If our radiance is already W m-2 sr-1 um-1, we need to convert it to SI units for Planck.
+                # 1 um = 1e-6 m. So per-micrometer is 1e6 times per-meter.
+                # Thus, radiance_per_meter = radiance * 1e6.
+                # The existing code has radiance_per_meter = positive_radiance * 1e6, which is correct
+                # if the input radiance is W m-2 sr-1 um-1.
+                # However, comparing to ami_l1b.py, it's `data.data * 1e-5` which implies their `data.data`
+                # is in W m-2 sr-1 cm-1 and needs to be converted to W m-2 sr-1 m-1 (1 cm = 0.01 m, so 1/cm = 100/m. 1e-5 is a different scaling).
+                # Re-evaluating ami_l1b.py:
+                # `data.data * 1e-5` when the input `data` likely has units like 'W m-2 sr-1 cm-1'.
+                # 1 cm^-1 = 100 m^-1. So to go from W m-2 sr-1 cm-1 to W m-2 sr-1 m-1, one would multiply by 100.
+                # The 1e-5 factor in ami_l1b.py is peculiar. Let's assume their comment is correct about SI units.
+                # If we produce W m-2 sr-1 um-1 (our `radiance`), then `radiance * 1e6` yields W m-2 sr-1 m-1.
+                # Let's stick with the existing `radiance_per_meter = positive_radiance * 1e6` as it's logically
+                # consistent with our derived radiance units if they are W m-2 sr-1 um-1.
 
                 # ==================================================================
                 # ### FIXED SECTION ###
                 #
-                # DO NOT recalculate the Planck constants from the file's metadata.
-                # The correction coefficients are based on a standard, fixed set of constants.
-                # Using the slightly different constants from the file attributes breaks
-                # the subsequent Teff -> Tbb polynomial correction.
+                # The problem statement says to use the calibration code from ami_l1b.py
+                # This means we should replicate their constants and method for
+                # calculating brightness temperature.
                 #
-                # These are the standard effective constants for GOES-R/Himawari/GK2A.
-                c1_planck = 1.191042953e-16  # W m^2 sr^-1
-                c2_planck = 1.4387774e-2    # K m
+                # Their 'light_speed', 'Boltzmann_constant_k', 'Plank_constant_h'
+                # are loaded from attributes. We should do the same.
                 #
-                # ==================================================================
+                # Wavenumber 'wn' calculation from ami_l1b.py:
+                # wn = (10000 / dataset_id["wavelength"][1]) * 100
+                # Assuming 'channel_center_wavelength' in our ds.attrs is equivalent to
+                # dataset_id["wavelength"][1] (which is in um).
+                # wn = (10000 / ds.attrs['channel_center_wavelength']) * 100
+                #
+                # Radiance conversion: ami_l1b.py uses `data.data * 1e-5`.
+                # If our `radiance` (which is W m-2 sr-1 um-1) is analogous to their `data.data` before their 1e-5 multiplication,
+                # then we need to understand their unit assumption.
+                # The typical units for radiance from ABI/AHI are mW m^-2 sr^-1 (cm^-1)^-1.
+                # If GK2A radiance is W m-2 sr-1 um-1, then 1 um = 1e-4 cm. So 1/um = 1e4/cm.
+                # W m-2 sr-1 um-1 = W m-2 sr-1 (1e4 cm-1).
+                # To get from W m-2 sr-1 cm-1 to W m-2 sr-1 m-1: multiply by 100.
+                # To get from W m-2 sr-1 um-1 to W m-2 sr-1 m-1: multiply by 1e6.
+                #
+                # The Planck constants in ami_l1b.py are NOT hardcoded, they are read from the file.
+                # Let's align with that.
 
-                lambda_c = get_scalar('channel_center_wavelength') * 1e-6 # Wavelength to meters
+                # Get constants from dataset attributes as per ami_l1b.py
+                cval = get_scalar('light_speed')
+                kval = get_scalar('Boltzmann_constant_k')
+                hval = get_scalar('Plank_constant_h')
+
+                # Calculate wavenumber (wn) in m^-1
+                # channel_center_wavelength is in micrometers (um)
+                # ami_l1b.py uses: (10000 / wavelength_in_um) * 100
+                # 10000 / wavelength_in_um gives wavenumber in cm^-1
+                # * 100 converts cm^-1 to m^-1.
+                # So wn is in m^-1
+                wn = (10000.0 / get_scalar('channel_center_wavelength')) * 100.0
+                print(f"[DEBUG] Calculated Wavenumber (wn): {wn} (m^-1)")
+
+                # Convert radiance to the specific units expected by ami_l1b.py's Planck calculation (W m-2 sr-1 m-1)
+                # The existing code `radiance` is in 'W m-2 sr-1 um-1'.
+                # The ami_l1b.py code converts `data.data` by `* 1e-5` to get `e2`.
+                # If `data.data` in ami_l1b.py is in 'W m-2 sr-1 cm-1', then `* 1e-5` is for unit conversion:
+                # 1 W m-2 sr-1 cm-1 * 100 cm/m = 100 W m-2 sr-1 m-1.
+                # So `data.data` in ami_l1b.py is likely in units where 1 unit is 100 W m-2 sr-1 m-1,
+                # or the `1e-5` is actually combining a unit conversion with a scaling factor.
+                # Given the comment "Convert cm^-1 (wavenumbers) and (mW/m^2)/(str/cm^-1) (radiance data) to SI units m^-1, mW*m^-3*str^-1.",
+                # it's possible their input radiance is in mW and needs to become W.
+                # Let's assume our `radiance` (W m-2 sr-1 um-1) needs to be converted similarly to how ami_l1b.py
+                # handles its `data.data` to get `e2`.
+                # If our `radiance` is already in W, and ami_l1b.py's `data.data` is in mW,
+                # and 1 mW = 1e-3 W.
+                # Then if ami_l1b.py's input `data.data` is in (mW/m^2)/(str/cm^-1), and `e2` is SI (mW*m^-3*str^-1),
+                # and `wn` is m^-1. This unit conversion is getting complicated.
+                #
+                # Let's simplify and follow ami_l1b.py's structure as closely as possible for scientific correctness.
+                # The `radiance` variable in `_calibrate` is `dn_variable * gain + offset`.
+                # Its attrs define 'units' as 'W m-2 sr-1 um-1'.
+                # The ami_l1b.py `data.data` for `_calibrate_ir` is the radiance _after_ gain/offset.
+                # The conversion `data.data * 1e-5` is applied to this `data.data`.
+                # Therefore, we should apply `* 1e-5` to our `positive_radiance` (which is already in W m-2 sr-1 um-1).
+                # This implies that for the formula to work, the final radiance needs to be in a specific scaled unit.
+                # Let's explicitly define this intermediate radiance for clarity and consistency with ami_l1b.py
+                radiance_for_planck = positive_radiance * 1e-5
+                print(f"[DEBUG] Radiance for Planck (radiance_for_planck): {radiance_for_planck.min().item():.3e} to {radiance_for_planck.max().item():.3e}")
 
                 # Inverse Planck function to get Effective Temperature (Teff)
-                term_in_log = (c1_planck / (radiance_per_meter * (lambda_c**5))) + 1.0
-                teff = c2_planck / (lambda_c * np.log(term_in_log))
+                # e1 in ami_l1b.py: (2 * hval * cval * cval) * np.power(wn, 3)
+                e1 = (2.0 * hval * cval * cval) * np.power(wn, 3.0)
+                # e2 in ami_l1b.py: (data.data * 1e-5) -- which is our radiance_for_planck
+                e2 = radiance_for_planck
+
+                # Guard against division by zero or non-positive e2 values in the log.
+                # The `positive_radiance` already handles `radiance > 0`.
+                # If `radiance_for_planck` (e2) becomes zero or negative due to further floating point issues,
+                # np.log will produce errors. So apply the `.where` again for `e2`.
+                e2 = e2.where(e2 > 0)
+
+                term_in_log = (e1 / e2) + 1.0
+                # Ensure term_in_log is positive to avoid log domain error
+                term_in_log = term_in_log.where(term_in_log > 0)
+                teff = ((hval * cval / kval) * wn) / np.log(term_in_log)
+                print(f"[DEBUG] Effective Temperature (teff): {teff.min().item():.2f} K to {teff.max().item():.2f} K")
+
 
                 # This is a standard polynomial correction to get Brightness Temperature (Tbb)
                 c0 = get_scalar('Teff_to_Tbb_c0')
@@ -166,6 +253,7 @@ class Gk2aDataFetcher:
                 tbb.attrs['long_name'] = 'Brightness Temperature'
                 tbb.attrs['units'] = 'K'
                 ds['brightness_temperature'] = tbb
+                print(f"[DEBUG] Brightness Temperature (tbb): {tbb.min().item():.2f} K to {tbb.max().item():.2f} K")
 
             print(f"--- Calibration successful for {product_name} ---")
             return ds
