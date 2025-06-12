@@ -74,7 +74,26 @@ class Gk2aDataFetcher:
         """
         print(f"--- Entering Calibration for {product_name} ---")
         try:
-            # --- Definitive helper to get a scalar value ---
+            # --- Extensive Debugging Prints ---
+            dn_variable = ds['image_pixel_values']
+            gain_attr = ds.attrs.get('DN_to_Radiance_Gain', 'N/A')
+            offset_attr = ds.attrs.get('DN_to_Radiance_Offset', 'N/A')
+
+            print(f"\n[DEBUG] Raw 'image_pixel_values' info:")
+            print(f"  - Type: {type(dn_variable)}")
+            print(f"  - Shape: {dn_variable.shape}")
+            print(f"  - Dtype: {dn_variable.dtype}")
+            print(f"  - Underlying data type: {type(dn_variable.data)}")
+
+
+            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Gain' attribute info:")
+            print(f"  - Type: {type(gain_attr)}")
+            print(f"  - Value: {repr(gain_attr)}")
+            
+            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Offset' attribute info:")
+            print(f"  - Type: {type(offset_attr)}")
+            print(f"  - Value: {repr(offset_attr)}")
+            
             def get_scalar(attr_name):
                 val = ds.attrs[attr_name]
                 print(f"  [get_scalar] Initial value for '{attr_name}': {repr(val)} (type: {type(val)})")
@@ -87,20 +106,19 @@ class Gk2aDataFetcher:
 
             gain = get_scalar('DN_to_Radiance_Gain')
             offset = get_scalar('DN_to_Radiance_Offset')
-            
-            # Explicitly operate on the underlying numpy/dask array
-            dn_array = ds['image_pixel_values'].data
-            radiance_array = dn_array * gain + offset
-            
-            radiance = xr.DataArray(
-                radiance_array,
-                coords=ds['image_pixel_values'].coords,
-                dims=ds['image_pixel_values'].dims,
-                attrs={'units': 'W m-2 sr-1 um-1'}
-            )
+
+            print("\n[DEBUG] Processed scalar coefficients:")
+            print(f"  - Gain: {gain} (type: {type(gain)})")
+            print(f"  - Offset: {offset} (type: {type(offset)})")
+
+            print("\n[DEBUG] Attempting multiplication: radiance = dn_variable * gain + offset")
+            radiance = dn_variable * gain + offset
+            radiance.attrs['units'] = 'W m-2 sr-1 um-1'
             print("[DEBUG] DN to Radiance conversion successful.")
             
+            # --- Channel-Specific Calibration ---
             channel_type = product_name[:2]
+
             if channel_type in ['vi', 'nr']:
                 c = get_scalar('Radiance_to_Albedo_c')
                 albedo = radiance * c * 100
@@ -116,9 +134,8 @@ class Gk2aDataFetcher:
                 
                 c1_planck = 2 * h * c_light**2
                 c2_planck = (h * c_light) / k
-                radiance_per_meter = radiance * 1e6
-                term_in_log = (c1 / (radiance_per_meter * (lambda_c**5))) + 1.0
-                teff = c2 / (lambda_c * np.log(term_in_log))
+                wavenumber_m = (1 / lambda_c)
+                teff = (c2_planck * wavenumber_m) / np.log(1 + (c1_planck * wavenumber_m**3) / radiance)
 
                 c0 = get_scalar('Teff_to_Tbb_c0')
                 c1_t = get_scalar('Teff_to_Tbb_c1')
@@ -135,8 +152,10 @@ class Gk2aDataFetcher:
         except Exception as e:
             print(f"\n---!!! CALIBRATION FAILED for {product_name} !!!---", file=sys.stderr)
             print(f"ERROR MESSAGE: {e}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
+            print("\n--- Full Stack Trace ---", file=sys.stderr)
+            traceback.print_exc()
             print("------------------------", file=sys.stderr)
+            print("Returning uncalibrated data.", file=sys.stderr)
             return ds
 
 
