@@ -1,0 +1,11 @@
+boto3
+pandas
+python-dateutil
+xarray
+netCDF4
+h5netcdf
+dask
+s3fs
+matplotlib
+numpy
+scikit-image
