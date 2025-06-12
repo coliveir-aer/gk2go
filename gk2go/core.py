@@ -73,12 +73,16 @@ class Gk2aDataFetcher:
         """
         print(f"Calibrating data for {product_name}...")
         try:
-            # --- Robustly get calibration coefficients as scalars ---
-            # This forces the attribute to a numpy array and uses .item()
-            # to extract the single scalar value. This is the standard way
-            # to handle attributes that might be scalars, lists, or arrays.
+            # --- Definitive helper to get a scalar value ---
+            # This robustly handles scalars, and any level of nested
+            # lists, tuples, or numpy arrays containing a single value.
             def get_scalar(attr_name):
-                return np.asarray(ds.attrs[attr_name]).item()
+                val = ds.attrs[attr_name]
+                while isinstance(val, (list, tuple, np.ndarray)):
+                    if len(val) == 0:
+                        raise ValueError(f"Calibration coefficient {attr_name} is an empty sequence.")
+                    val = val[0]
+                return float(val)
 
             # --- Common Step: DN to Radiance ---
             gain = get_scalar('DN_to_Radiance_Gain')
