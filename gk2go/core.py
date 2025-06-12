@@ -35,7 +35,7 @@ class GK2ADefs:
         if ami_match:
             data = ami_match.groupdict()
             try:
-                data['datetime'] = datetime.strptime(data['timestamp'], '%Y%m%d%H%M')
+                data['datetime'] = datetime.strptime(data['timestamp'], '%Ym%d%H%M')
             except ValueError:
                 data['datetime'] = None
             return data
@@ -72,35 +72,16 @@ class Gk2aDataFetcher:
         """
         Calibrates the raw data in the dataset to scientific units.
         """
-        print(f"--- Entering Calibration for {product_name} ---")
+        print(f"Calibrating data for {product_name}...")
         try:
-            # --- Definitive helper to get a scalar value ---
             def get_scalar(attr_name):
-                val = ds.attrs[attr_name]
-                print(f"  [get_scalar] Initial value for '{attr_name}': {repr(val)} (type: {type(val)})")
-                while isinstance(val, (list, tuple, np.ndarray)):
-                    if len(val) == 0:
-                        raise ValueError(f"Calibration coefficient {attr_name} is an empty sequence.")
-                    val = val[0]
-                    print(f"  [get_scalar] Unwrapped to: {repr(val)} (type: {type(val)})")
-                return float(val)
+                return np.asarray(ds.attrs[attr_name]).item()
 
             gain = get_scalar('DN_to_Radiance_Gain')
             offset = get_scalar('DN_to_Radiance_Offset')
+            radiance = ds['image_pixel_values'] * gain + offset
+            radiance.attrs['units'] = 'W m-2 sr-1 um-1'
             
-            # Operate on the raw dask/numpy array to avoid potential xarray overhead issues
-            dn_array = ds['image_pixel_values'].data
-            radiance_array = dn_array * gain + offset
-            
-            radiance = xr.DataArray(
-                radiance_array,
-                coords=ds['image_pixel_values'].coords,
-                dims=ds['image_pixel_values'].dims,
-                attrs={'units': 'W m-2 sr-1 um-1'}
-            )
-            print("[DEBUG] DN to Radiance conversion successful.")
-            
-            # --- Channel-Specific Calibration ---
             channel_type = product_name[:2]
 
             if channel_type in ['vi', 'nr']:
@@ -116,10 +97,16 @@ class Gk2aDataFetcher:
                 c_light = get_scalar('light_speed')
                 lambda_c = get_scalar('channel_center_wavelength') * 1e-6
                 
-                c1_planck = 2 * h * c_light**2
-                c2_planck = (h * c_light) / k
-                wavenumber_m = (1 / lambda_c)
-                teff = (c2_planck * wavenumber_m) / np.log(1 + (c1_planck * wavenumber_m**3) / radiance)
+                # Correctly define Planck constants
+                c1 = 2 * h * c_light**2
+                c2 = (h * c_light) / k
+
+                # Convert radiance from "per micrometer" to "per meter" for calculation
+                radiance_per_meter = radiance * 1e6
+
+                # Use the wavelength form of the Planck function inversion
+                term_in_log = (c1 / (radiance_per_meter * (lambda_c**5))) + 1.0
+                teff = c2 / (lambda_c * np.log(term_in_log))
 
                 c0 = get_scalar('Teff_to_Tbb_c0')
                 c1_t = get_scalar('Teff_to_Tbb_c1')
@@ -130,24 +117,17 @@ class Gk2aDataFetcher:
                 tbb.attrs['units'] = 'K'
                 ds['brightness_temperature'] = tbb
 
-            print(f"--- Calibration successful for {product_name} ---")
+            print(f"Calibration successful.")
             return ds
 
         except Exception as e:
-            print(f"\n---!!! CALIBRATION FAILED for {product_name} !!!---", file=sys.stderr)
-            print(f"ERROR MESSAGE: {e}", file=sys.stderr)
-            print("\n--- Full Stack Trace ---", file=sys.stderr)
-            traceback.print_exc()
-            print("------------------------", file=sys.stderr)
-            print("Returning uncalibrated data.", file=sys.stderr)
+            print(f"WARNING: Could not calibrate dataset for {product_name}. Error: {e}", file=sys.stderr)
             return ds
-
 
     @staticmethod
     def _generate_s3_prefixes(sensor, product, start_time, end_time, area=None):
         if not area:
             raise ValueError("The 'area' parameter is required for L1B data.")
-
         base_prefix = f"{sensor.upper()}/L1B/{area.upper()}/"
         current_time = start_time
         while current_time <= end_time:
@@ -182,32 +162,18 @@ class Gk2aDataFetcher:
             return None
 
     def get_data(self, sensor, product, area, query_type='latest', target_time=None, start_time=None, end_time=None, calibrate=False):
-        print(f"\n--- Entering get_data for product: {product}, query: {query_type} ---")
-        
         if query_type == 'latest':
             search_end = datetime.utcnow()
             search_start = search_end - timedelta(hours=2)
             found_files = self._find_files(sensor, product, search_start, search_end, area)
-            if not found_files: 
-                print("[INFO] No files found for 'latest' query.")
-                return None
+            if not found_files: return None
             
             latest_file = found_files[-1]
-            print(f"[DEBUG] Latest file found: {latest_file['s3_key']}")
-            
-            print("[DEBUG] Calling _load_as_xarray...")
             ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{latest_file['s3_key']}")
+            if not ds: return None
             
-            if not ds: 
-                print("[ERROR] _load_as_xarray returned None.")
-                return None
-            
-            print(f"[DEBUG] Dataset loaded. Calibrate flag is: {calibrate}")
             if calibrate:
-                print("[DEBUG] Entering _calibrate function call...")
                 ds = self._calibrate(ds, product)
-            
-            print("[DEBUG] Expanding dims and returning dataset.")
             return ds.expand_dims(time=[latest_file['datetime']])
 
         elif query_type == 'nearest':
@@ -223,7 +189,6 @@ class Gk2aDataFetcher:
             
             if calibrate:
                 ds = self._calibrate(ds, product)
-
             return ds.expand_dims(time=[nearest_file['datetime']])
 
         elif query_type == 'range':
