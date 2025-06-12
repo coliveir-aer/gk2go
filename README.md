@@ -24,7 +24,6 @@ The /examples directory contains scripts demonstrating how to use the library. F
 Here is a basic example:
 
 ```
-from datetime import datetime  
 from gk2go import Gk2aDataFetcher
 
 # 1. Initialize the fetcher  
