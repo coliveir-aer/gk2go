@@ -122,10 +122,15 @@ class Gk2aDataFetcher:
 
             if channel_type in ['vi', 'nr']:
                 c = get_scalar('Radiance_to_Albedo_c')
-                albedo = radiance * c * 100
+                # Calculate fractional albedo first, then clip to 0-1 range
+                fractional_albedo = radiance * c
+                # Ensure albedo is physically valid (between 0.0 and 1.0)
+                albedo = np.clip(fractional_albedo, 0.0, 1.0) * 100
                 albedo.attrs['long_name'] = 'Albedo'
                 albedo.attrs['units'] = '%'
                 ds['albedo'] = albedo
+                print(f"[DEBUG] Albedo: {albedo.min().compute().item():.2f}% to {albedo.max().compute().item():.2f}%")
+
 
             elif channel_type in ['sw', 'ir', 'wv']:
                 # The Planck function is only defined for positive radiance.
@@ -140,16 +145,16 @@ class Gk2aDataFetcher:
 
                 # Calculate wavenumber (wn) in m^-1
                 # channel_center_wavelength is in micrometers (um)
-                # 10000 / wavelength_in_um gives wavenumber in cm^-1
+                # (10000 / wavelength_in_um) gives wavenumber in cm^-1
                 # * 100 converts cm^-1 to m^-1.
                 # So wn is in m^-1
                 wn = (10000.0 / get_scalar('channel_center_wavelength')) * 100.0
                 print(f"[DEBUG] Calculated Wavenumber (wn): {wn} (m^-1)")
 
-                # Convert radiance to the specific units expected by Planck calculation (W m-2 sr-1 m-1)
-                # Therefore, we should apply `* 1e-5` to our `positive_radiance` (which is already in W m-2 sr-1 um-1).
+                # Convert radiance to the specific units expected for Planck calculation (W m-2 sr-1 m-1)
+                # The `radiance` is in 'W m-2 sr-1 um-1'. The 1e-5 factor is applied for unit consistency
+                # with the Planck constants provided in the file attributes.
                 radiance_for_planck = positive_radiance * 1e-5
-                # Fix: Add .compute() to force evaluation before .item()
                 print(f"[DEBUG] Radiance for Planck (radiance_for_planck): {radiance_for_planck.min().compute().item():.3e} to {radiance_for_planck.max().compute().item():.3e}")
 
                 # Inverse Planck function to get Effective Temperature (Teff)
@@ -157,16 +162,12 @@ class Gk2aDataFetcher:
                 e2 = radiance_for_planck
 
                 # Guard against division by zero or non-positive e2 values in the log.
-                # The `positive_radiance` already handles `radiance > 0`.
-                # If `radiance_for_planck` (e2) becomes zero or negative due to further floating point issues,
-                # np.log will produce errors. So apply the `.where` again for `e2`.
                 e2 = e2.where(e2 > 0)
 
                 term_in_log = (e1 / e2) + 1.0
                 # Ensure term_in_log is positive to avoid log domain error
                 term_in_log = term_in_log.where(term_in_log > 0)
                 teff = ((hval * cval / kval) * wn) / np.log(term_in_log)
-                # Fix: Add .compute() to force evaluation before .item()
                 print(f"[DEBUG] Effective Temperature (teff): {teff.min().compute().item():.2f} K to {teff.max().compute().item():.2f} K")
 
 
@@ -179,7 +180,6 @@ class Gk2aDataFetcher:
                 tbb.attrs['long_name'] = 'Brightness Temperature'
                 tbb.attrs['units'] = 'K'
                 ds['brightness_temperature'] = tbb
-                # Fix: Add .compute() to force evaluation before .item()
                 print(f"[DEBUG] Brightness Temperature (tbb): {tbb.min().compute().item():.2f} K to {tbb.max().compute().item():.2f} K")
 
             print(f"--- Calibration successful for {product_name} ---")
