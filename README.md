@@ -24,32 +24,43 @@ The /examples directory contains scripts demonstrating how to use the library. F
 Here is a basic example:
 
 ```
-from gk2go import Gk2aDataFetcher
 import matplotlib.pyplot as plt
+import pandas as pd
+from gk2go import Gk2aDataFetcher
 
-# 1. Initialize the fetcher  
+# 1. Initialize the fetcher
 fetcher = Gk2aDataFetcher()
 
-# 2. Get the 'latest' image for the 10.5 µm channel  
-latest_ds = fetcher.get_data(  
-    sensor='ami', product='ir105', area='fd', query_type='latest'  
+# 2. Get the latest calibrated image for the 10.5 µm "Clean IR" channel
+#    Setting calibrate=True converts the raw data to Brightness Temperature.
+latest_calibrated_ds = fetcher.get_data(
+    sensor='ami', product='ir105', area='fd', query_type='latest', calibrate=True
 )
 
-if latest_ds:  
-    print("--- Latest Data Found ---")  
-    print(latest_ds)
+# 3. Check if data was found and calibrated, then plot it
+if latest_calibrated_ds and 'brightness_temperature' in latest_calibrated_ds:
+    print("--- Latest Calibrated Data Found ---")
+    print(latest_calibrated_ds)
+    
+    # Extract the data and the timestamp for plotting
+    bt_data = latest_calibrated_ds.squeeze()['brightness_temperature']
+    time_val = pd.to_datetime(latest_calibrated_ds.time.values.item())
+    time_str = time_val.strftime('%Y-%m-%d %H:%M Z')
+    
+    # Create a simple plot
+    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
+    
+    # Use a standard temperature colormap and display the data
+    im = ax.imshow(bt_data, cmap='inferno')
+    
+    # Add a colorbar with the correct label and units
+    cbar = fig.colorbar(im, ax=ax, orientation='vertical', pad=0.02)
+    cbar.set_label(f"{bt_data.attrs['long_name']} ({bt_data.attrs['units']})")
+    
+    ax.set_title(f'Latest Calibrated GK-2A (10.5 µm)\n{time_str}')
+    ax.axis('off') # Hide the axes for a cleaner image
+    plt.show()
 
-
-# 3. Display the image using matplotlib
-if latest_ds:
-  plt.figure(figsize=(10, 10))
-  plt.imshow(latest_ds['image_pixel_values'][0], cmap='gray')
-  plt.title(f"GK2A AMI IR105 Full Disk Image (Latest)")
-  plt.colorbar(label='Pixel Value')
-  plt.axis('off')  # Hide axes
-  plt.show()
-else:
-  print("No data found to display.")
 ```
 
 ## **Contributing**
