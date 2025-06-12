@@ -15,7 +15,7 @@ gk2go provides a simple yet powerful, goes2go-inspired interface to query and ac
 
 You can install gk2go directly from its GitHub repository:
 
-pip install git+https://github.com/coliveir-aer/gk2go.git
+    pip install git+https://github.com/coliveir-aer/gk2go.git
 
 ## **Quick Start**
 
