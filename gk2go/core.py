@@ -127,14 +127,24 @@ class Gk2aDataFetcher:
                 ds['albedo'] = albedo
                 
             elif channel_type in ['sw', 'ir', 'wv']:
+                # The Planck function is only defined for positive radiance. Where the linear
+                # calibration produces non-physical (negative or zero) radiance, we must
+                # treat it as invalid data (NaN) to prevent a math error.
+                positive_radiance = radiance.where(radiance > 0)
+
+                # The radiance MUST be converted from 'per-micrometer' to 'per-meter' (SI unit)
+                # for the Planck formula to work with SI constants. This multiplication is correct.
+                radiance_per_meter = positive_radiance * 1e6
+
                 h = get_scalar('Plank_constant_h')
                 k = get_scalar('Boltzmann_constant_k')
                 c_light = get_scalar('light_speed')
-                lambda_c = get_scalar('channel_center_wavelength') * 1e-6
-                
+                lambda_c = get_scalar('channel_center_wavelength') * 1e-6 # This is also correct
+
                 c1_planck = 2 * h * c_light**2
                 c2_planck = (h * c_light) / k
-                radiance_per_meter = radiance
+
+                # Perform the calculation using the clean, correctly-scaled radiance
                 term_in_log = (c1_planck / (radiance_per_meter * (lambda_c**5))) + 1.0
                 teff = c2_planck / (lambda_c * np.log(term_in_log))
 
