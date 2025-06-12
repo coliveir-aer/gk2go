@@ -34,16 +34,12 @@ def plot_calibrated_data(fig, dataset, ax, title=''):
         if 'albedo' in dataset:
             dat = dataset.squeeze()['albedo']
             cmap = 'gray'
-            vmin, vmax = 0, 100 # Albedo is a percentage
         elif 'brightness_temperature' in dataset:
             dat = dataset.squeeze()['brightness_temperature']
             cmap = 'gray_r' # Inverted for temperature
-            vmin, vmax = 180, 330 # Typical range for Earth's brightness temp in Kelvin
         else: # Fallback to raw pixel values
             dat = dataset.squeeze()['image_pixel_values']
             cmap = 'gray'
-            vmin, vmax = np.nanpercentile(dat, [2,98])
-
 
         y_dim_size = dat.shape[0]
         decimation = max(1, y_dim_size // 1100) * 2
@@ -52,7 +48,8 @@ def plot_calibrated_data(fig, dataset, ax, title=''):
         if '_FillValue' in dat.attrs:
             dat_to_plot = dat_to_plot.where(dat_to_plot != dat.attrs['_FillValue'])
 
-        im = ax.imshow(dat_to_plot, cmap=cmap, vmin=vmin, vmax=vmax)
+        # Let imshow automatically determine the color scale for the calibrated data
+        im = ax.imshow(dat_to_plot, cmap=cmap)
         
         # Add a labeled colorbar with the correct units
         units = dat.attrs.get('units', 'N/A')
