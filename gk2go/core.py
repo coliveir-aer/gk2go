@@ -75,23 +75,20 @@ class Gk2aDataFetcher:
         print(f"--- Entering Calibration for {product_name} ---")
         try:
             # --- Definitive helper to get a scalar value ---
+            # This robustly handles scalars, and any level of nested
+            # lists, tuples, or numpy arrays containing a single value by
+            # forcing the attribute to a numpy array and then calling .item().
             def get_scalar(attr_name):
-                val = ds.attrs[attr_name]
-                while isinstance(val, (list, tuple, np.ndarray)):
-                    if len(val) == 0:
-                        raise ValueError(f"Calibration coefficient {attr_name} is an empty sequence.")
-                    val = val[0]
-                return float(val)
+                return np.asarray(ds.attrs[attr_name]).item()
 
             # --- Common Step: DN to Radiance ---
             gain = get_scalar('DN_to_Radiance_Gain')
             offset = get_scalar('DN_to_Radiance_Offset')
 
-            # Operate on the raw dask/numpy array, not the xarray object, to avoid type errors.
+            # Operate on the raw dask/numpy array to avoid potential xarray overhead issues
             dn_array = ds['image_pixel_values'].data
             radiance_array = dn_array * gain + offset
             
-            # Create a new xarray.DataArray for the result
             radiance = xr.DataArray(
                 radiance_array,
                 coords=ds['image_pixel_values'].coords,
