@@ -25,6 +25,7 @@ Here is a basic example:
 
 ```
 from gk2go import Gk2aDataFetcher
+import matplotlib.pyplot as plt
 
 # 1. Initialize the fetcher  
 fetcher = Gk2aDataFetcher()
@@ -37,6 +38,18 @@ latest_ds = fetcher.get_data(
 if latest_ds:  
     print("--- Latest Data Found ---")  
     print(latest_ds)
+
+
+# 3. Display the image using matplotlib
+if latest_ds:
+  plt.figure(figsize=(10, 10))
+  plt.imshow(latest_ds['image_pixel_values'][0], cmap='gray')
+  plt.title(f"GK2A AMI IR105 Full Disk Image (Latest)")
+  plt.colorbar(label='Pixel Value')
+  plt.axis('off')  # Hide axes
+  plt.show()
+else:
+  print("No data found to display.")
 ```
 
 ## **Contributing**
