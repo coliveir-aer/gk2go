@@ -2,21 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Example: Plot All GK2A Channels
+Example: Plot All GK2A Channels (Calibrated)
 
 This script demonstrates how to use the `gk2go` library to fetch the
-latest full disk image for all 16 AMI channels and display them in a
-4x4 grid.
-
-To run this script, first install the `gk2go` library and its dependencies:
-  pip install -r ../requirements.txt
-  pip install .  (from the root project directory)
+latest full disk image for all 16 AMI channels, calibrate them to
+scientific units (Albedo or Brightness Temperature), and display them
+in a 4x4 grid with appropriate color scaling.
 """
 
 import matplotlib.pyplot as plt
 from datetime import datetime
 import numpy as np
-from skimage import exposure
 import sys
 
 # Import the data fetcher from our installed library
@@ -28,41 +24,49 @@ except ImportError:
     print("From the project root, run: pip install .")
     sys.exit(1)
 
-def plot_l1b_data(fig, dataset, ax, title=''):
+def plot_calibrated_data(fig, dataset, ax, title=''):
     """
-    Plots the GK2A L1B data on a matplotlib axis, using histogram
-    equalization for optimal contrast and adds a labeled colorbar.
+    Intelligently plots calibrated GK2A data (Albedo or Brightness Temp).
     """
     try:
-        dat = dataset.squeeze()['image_pixel_values']
+        # --- Determine which variable to plot ---
+        if 'albedo' in dataset:
+            dat = dataset.squeeze()['albedo']
+            cmap = 'gray'
+        elif 'brightness_temperature' in dataset:
+            dat = dataset.squeeze()['brightness_temperature']
+            cmap = 'gray_r' # Inverted for temperature
+        else: # Fallback to raw pixel values
+            dat = dataset.squeeze()['image_pixel_values']
+            cmap = 'gray'
+
         y_dim_size = dat.shape[0]
         decimation = max(1, y_dim_size // 1100) * 2
         dat_to_plot = dat[::decimation, ::decimation].load()
 
+        # Handle fill values by converting them to NaN so they are not plotted
         if '_FillValue' in dat.attrs:
-            image_data = dat_to_plot.where(dat_to_plot != dat.attrs['_FillValue'])
-        else:
-            image_data = dat_to_plot
+            dat_to_plot = dat_to_plot.where(dat_to_plot != dat.attrs['_FillValue'])
 
-        mask = ~np.isnan(image_data)
-        equalized_data = np.full(image_data.shape, np.nan, dtype=float)
-        if np.any(mask):
-            equalized_data[mask] = exposure.equalize_hist(image_data.values[mask])
+        # --- Use percentile stretching for robust contrast ---
+        # This automatically finds the best color range for each channel's unique data.
+        vmin, vmax = np.nanpercentile(dat_to_plot, [2, 98])
 
-        cmap = 'gray_r' if title.startswith('IR') or title.startswith('WV') else 'gray'
-        im = ax.imshow(equalized_data, cmap=cmap)
+        # Plot the actual calibrated data with the defined color limits
+        im = ax.imshow(dat_to_plot, cmap=cmap, vmin=vmin, vmax=vmax)
         
-        units = dat.attrs.get('units', 'DN')
+        # Add a labeled colorbar with the correct units
+        units = dat.attrs.get('units', 'N/A')
         cbar = fig.colorbar(im, ax=ax, orientation='horizontal', pad=0.05, shrink=0.8)
-        cbar.set_label(f"Equalized {units}", fontsize=8)
+        cbar.set_label(f"{units}", fontsize=8)
         cbar.ax.tick_params(labelsize=7)
-        cbar.set_ticks([0, 0.5, 1.0])
 
         wavelength = dataset.attrs.get('channel_center_wavelength', 'N/A')
         ax.set_title(f"{title} ({wavelength} um)", fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
+
     except Exception as e:
-        print(f"ERROR: Could not plot L1B data for {title}. Error: {e}")
+        print(f"ERROR: Could not plot data for {title}. Error: {e}")
         ax.text(0.5, 0.5, 'Plotting Error', ha='center', va='center', color='red')
         ax.set_title(title, fontsize=10)
 
@@ -83,17 +87,18 @@ def main():
     # Set up the 4x4 plot
     fig, axes = plt.subplots(4, 4, figsize=(16, 18))
     axes = axes.flatten()
-    fig.suptitle('Latest GK2A Full Disk Images by Channel', fontsize=20, y=0.98)
+    fig.suptitle('Latest Calibrated GK2A Full Disk Images by Channel', fontsize=20, y=0.98)
 
     # Loop through channels and plot
     for i, channel in enumerate(ami_channels):
         print(f"\n--- Processing Channel: {channel} ---")
         ax = axes[i]
+        # Request calibrated data
         ds = fetcher.get_data(
-            sensor='ami', product=channel, area='fd', query_type='latest'
+            sensor='ami', product=channel, area='fd', query_type='latest', calibrate=True
         )
         if ds:
-            plot_l1b_data(fig, ds, ax, title=channel.upper())
+            plot_calibrated_data(fig, ds, ax, title=channel.upper())
         else:
             ax.text(0.5, 0.5, 'No Data Found', ha='center', va='center', color='red')
             ax.set_title(channel.upper(), fontsize=10)

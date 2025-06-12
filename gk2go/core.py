@@ -2,6 +2,7 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta
+import traceback
 
 import boto3
 import pandas as pd
@@ -11,6 +12,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from botocore import UNSIGNED
 from dateutil.parser import parse as parse_date
+import numpy as np
 
 class GK2ADefs:
     AMI_FILENAME_RE = re.compile(
@@ -66,11 +68,122 @@ class Gk2aDataFetcher:
     def __init__(self):
         self.s3_utils = S3Utils()
 
+    def _calibrate(self, ds, product_name):
+        """
+        Calibrates the raw data in the dataset to scientific units.
+        """
+        print(f"--- Entering Calibration for {product_name} ---")
+        try:
+            # --- Extensive Debugging Prints ---
+            dn_variable = ds['image_pixel_values']
+            gain_attr = ds.attrs.get('DN_to_Radiance_Gain', 'N/A')
+            offset_attr = ds.attrs.get('DN_to_Radiance_Offset', 'N/A')
+
+            print(f"\n[DEBUG] Raw 'image_pixel_values' info:")
+            print(f"  - Type: {type(dn_variable)}")
+            print(f"  - Shape: {dn_variable.shape}")
+            print(f"  - Dtype: {dn_variable.dtype}")
+            print(f"  - Underlying data type: {type(dn_variable.data)}")
+
+
+            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Gain' attribute info:")
+            print(f"  - Type: {type(gain_attr)}")
+            print(f"  - Value: {repr(gain_attr)}")
+
+            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Offset' attribute info:")
+            print(f"  - Type: {type(offset_attr)}")
+            print(f"  - Value: {repr(offset_attr)}")
+
+            def get_scalar(attr_name):
+                val = ds.attrs[attr_name]
+                print(f"  [get_scalar] Initial value for '{attr_name}': {repr(val)} (type: {type(val)})")
+                while isinstance(val, (list, tuple, np.ndarray)):
+                    if len(val) == 0:
+                        raise ValueError(f"Calibration coefficient {attr_name} is an empty sequence.")
+                    val = val[0]
+                    print(f"  [get_scalar] Unwrapped to: {repr(val)} (type: {type(val)})")
+                # Cast to float to handle cases where metadata gives a string (e.g., '10.5')
+                return float(val)
+
+            gain = get_scalar('DN_to_Radiance_Gain')
+            offset = get_scalar('DN_to_Radiance_Offset')
+
+            print("\n[DEBUG] Processed scalar coefficients:")
+            print(f"  - Gain: {gain} (type: {type(gain)})")
+            print(f"  - Offset: {offset} (type: {type(offset)})")
+
+            print("\n[DEBUG] Attempting multiplication: radiance = dn_variable * gain + offset")
+            radiance = dn_variable * gain + offset
+            radiance.attrs['units'] = 'W m-2 sr-1 um-1' # Note: This is radiance per-micrometer
+            print("[DEBUG] DN to Radiance conversion successful.")
+
+            # --- Channel-Specific Calibration ---
+            channel_type = product_name[:2]
+
+            if channel_type in ['vi', 'nr']:
+                c = get_scalar('Radiance_to_Albedo_c')
+                albedo = radiance * c * 100
+                albedo.attrs['long_name'] = 'Albedo'
+                albedo.attrs['units'] = '%'
+                ds['albedo'] = albedo
+
+            elif channel_type in ['sw', 'ir', 'wv']:
+                # The Planck function is only defined for positive radiance.
+                # Where the linear calibration produces non-physical (negative or zero) radiance,
+                # we must treat it as invalid data (NaN) to prevent a math error.
+                positive_radiance = radiance.where(radiance > 0)
+
+                # Radiance MUST be converted from 'per-micrometer' to 'per-meter' (SI unit)
+                # for the Planck formula to work with SI constants. This multiplication is correct.
+                radiance_per_meter = positive_radiance * 1e6
+
+                # ==================================================================
+                # ### FIXED SECTION ###
+                #
+                # DO NOT recalculate the Planck constants from the file's metadata.
+                # The correction coefficients are based on a standard, fixed set of constants.
+                # Using the slightly different constants from the file attributes breaks
+                # the subsequent Teff -> Tbb polynomial correction.
+                #
+                # These are the standard effective constants for GOES-R/Himawari/GK2A.
+                c1_planck = 1.191042953e-16  # W m^2 sr^-1
+                c2_planck = 1.4387774e-2    # K m
+                #
+                # ==================================================================
+
+                lambda_c = get_scalar('channel_center_wavelength') * 1e-6 # Wavelength to meters
+
+                # Inverse Planck function to get Effective Temperature (Teff)
+                term_in_log = (c1_planck / (radiance_per_meter * (lambda_c**5))) + 1.0
+                teff = c2_planck / (lambda_c * np.log(term_in_log))
+
+                # This is a standard polynomial correction to get Brightness Temperature (Tbb)
+                c0 = get_scalar('Teff_to_Tbb_c0')
+                c1_t = get_scalar('Teff_to_Tbb_c1')
+                c2_t = get_scalar('Teff_to_Tbb_c2')
+
+                tbb = c2_t * teff**2 + c1_t * teff + c0
+                tbb.attrs['long_name'] = 'Brightness Temperature'
+                tbb.attrs['units'] = 'K'
+                ds['brightness_temperature'] = tbb
+
+            print(f"--- Calibration successful for {product_name} ---")
+            return ds
+
+        except Exception as e:
+            print(f"\n---!!! CALIBRATION FAILED for {product_name} !!!---", file=sys.stderr)
+            print(f"ERROR MESSAGE: {e}", file=sys.stderr)
+            print("\n--- Full Stack Trace ---", file=sys.stderr)
+            traceback.print_exc()
+            print("------------------------", file=sys.stderr)
+            print("Returning uncalibrated data.", file=sys.stderr)
+            return ds
+
+
     @staticmethod
     def _generate_s3_prefixes(sensor, product, start_time, end_time, area=None):
         if not area:
             raise ValueError("The 'area' parameter is required for L1B data.")
-
         base_prefix = f"{sensor.upper()}/L1B/{area.upper()}/"
         current_time = start_time
         while current_time <= end_time:
@@ -88,8 +201,17 @@ class Gk2aDataFetcher:
             for obj in s3_objects:
                 filename = os.path.basename(obj['Key'])
                 parsed_data = GK2ADefs.parse_filename(filename)
-                if not parsed_data: continue
-                if not (start_time <= parsed_data.get('datetime', start_time - timedelta(seconds=1)) <= end_time): continue
+                
+                if not parsed_data: 
+                    continue
+                
+                file_time = parsed_data.get('datetime')
+                if not file_time:
+                    continue
+                    
+                if not (start_time <= file_time <= end_time): 
+                    continue
+
                 parsed_data['s3_key'] = obj['Key']
                 all_files.append(parsed_data)
         all_files.sort(key=lambda x: x.get('datetime', datetime.min))
@@ -104,7 +226,7 @@ class Gk2aDataFetcher:
             print(f"ERROR: Could not open S3 object {s3_path} as xarray.Dataset: {e}", file=sys.stderr)
             return None
 
-    def get_data(self, sensor, product, area, query_type='latest', target_time=None, start_time=None, end_time=None):
+    def get_data(self, sensor, product, area, query_type='latest', target_time=None, start_time=None, end_time=None, calibrate=False):
         if query_type == 'latest':
             search_end = datetime.utcnow()
             search_start = search_end - timedelta(hours=2)
@@ -113,7 +235,11 @@ class Gk2aDataFetcher:
             
             latest_file = found_files[-1]
             ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{latest_file['s3_key']}")
-            return ds.expand_dims(time=[latest_file['datetime']]) if ds else None
+            if not ds: return None
+            
+            if calibrate:
+                ds = self._calibrate(ds, product)
+            return ds.expand_dims(time=[latest_file['datetime']])
 
         elif query_type == 'nearest':
             if not target_time: raise ValueError("`target_time` is required for 'nearest' query.")
@@ -124,7 +250,11 @@ class Gk2aDataFetcher:
 
             nearest_file = min(found_files, key=lambda x: abs(x['datetime'] - target_time))
             ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{nearest_file['s3_key']}")
-            return ds.expand_dims(time=[nearest_file['datetime']]) if ds else None
+            if not ds: return None
+            
+            if calibrate:
+                ds = self._calibrate(ds, product)
+            return ds.expand_dims(time=[nearest_file['datetime']])
 
         elif query_type == 'range':
             if not start_time or not end_time: raise ValueError("`start_time` and `end_time` are required for 'range' query.")
@@ -136,8 +266,10 @@ class Gk2aDataFetcher:
                 ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{file_info['s3_key']}")
                 if ds:
                     main_var = next(iter(ds.data_vars))
-                    ds = ds[[main_var]]
-                    datasets.append(ds.expand_dims(time=[file_info['datetime']]))
+                    ds_clean = ds[[main_var]]
+                    if calibrate:
+                        ds_clean = self._calibrate(ds, product)
+                    datasets.append(ds_clean.expand_dims(time=[file_info['datetime']]))
             
             if not datasets: return None
             return xr.concat(datasets, dim='time')
