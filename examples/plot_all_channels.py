@@ -33,19 +33,12 @@ def plot_calibrated_data(fig, dataset, ax, title=''):
         if 'albedo' in dataset:
             dat = dataset.squeeze()['albedo']
             cmap = 'gray'
-            # Set color limits for Albedo (0-100%)
-            vmin, vmax = 0, 100
         elif 'brightness_temperature' in dataset:
             dat = dataset.squeeze()['brightness_temperature']
             cmap = 'gray_r' # Inverted for temperature
-            # Set a standard temperature range for Earth in Kelvin
-            vmin, vmax = 190, 310
-        else: # Fallback for uncalibrated data
+        else: # Fallback to raw pixel values
             dat = dataset.squeeze()['image_pixel_values']
             cmap = 'gray'
-            # For raw data, use percentile scaling
-            vmin, vmax = np.nanpercentile(dat.load(), [2, 98])
-
 
         y_dim_size = dat.shape[0]
         decimation = max(1, y_dim_size // 1100) * 2
@@ -54,6 +47,10 @@ def plot_calibrated_data(fig, dataset, ax, title=''):
         # Handle fill values by converting them to NaN so they are not plotted
         if '_FillValue' in dat.attrs:
             dat_to_plot = dat_to_plot.where(dat_to_plot != dat.attrs['_FillValue'])
+
+        # --- Use percentile stretching for robust contrast ---
+        # This automatically finds the best color range for each channel's unique data.
+        vmin, vmax = np.nanpercentile(dat_to_plot, [2, 98])
 
         # Plot the actual calibrated data with the defined color limits
         im = ax.imshow(dat_to_plot, cmap=cmap, vmin=vmin, vmax=vmax)
