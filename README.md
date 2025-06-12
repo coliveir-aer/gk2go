@@ -23,20 +23,22 @@ The /examples directory contains scripts demonstrating how to use the library. F
 
 Here is a basic example:
 
+```
 from datetime import datetime  
 from gk2go import Gk2aDataFetcher
 
-\# 1\. Initialize the fetcher  
-fetcher \= Gk2aDataFetcher()
+# 1. Initialize the fetcher  
+fetcher = Gk2aDataFetcher()
 
-\# 2\. Get the 'latest' image for the 10.5 µm channel  
-latest\_ds \= fetcher.get\_data(  
-    sensor='ami', product='ir105', area='fd', query\_type='latest'  
+# 2. Get the 'latest' image for the 10.5 µm channel  
+latest_ds = fetcher.get_data(  
+    sensor='ami', product='ir105', area='fd', query_type='latest'  
 )
 
-if latest\_ds:  
-    print("--- Latest Data Found \---")  
-    print(latest\_ds)
+if latest_ds:  
+    print("--- Latest Data Found ---")  
+    print(latest_ds)
+```
 
 ## **Contributing**
 
