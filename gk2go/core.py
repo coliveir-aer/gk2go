@@ -2,7 +2,6 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta
-import traceback
 
 import boto3
 import pandas as pd
@@ -72,51 +71,23 @@ class Gk2aDataFetcher:
         """
         Calibrates the raw data in the dataset to scientific units.
         """
-        print(f"--- Entering Calibration for {product_name} ---")
         try:
-            # --- Extensive Debugging Prints ---
-            dn_variable = ds['image_pixel_values']
-            gain_attr = ds.attrs.get('DN_to_Radiance_Gain', 'N/A')
-            offset_attr = ds.attrs.get('DN_to_Radiance_Offset', 'N/A')
-
-            print(f"\n[DEBUG] Raw 'image_pixel_values' info:")
-            print(f"  - Type: {type(dn_variable)}")
-            print(f"  - Shape: {dn_variable.shape}")
-            print(f"  - Dtype: {dn_variable.dtype}")
-            print(f"  - Underlying data type: {type(dn_variable.data)}")
-
-
-            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Gain' attribute info:")
-            print(f"  - Type: {type(gain_attr)}")
-            print(f"  - Value: {repr(gain_attr)}")
-            
-            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Offset' attribute info:")
-            print(f"  - Type: {type(offset_attr)}")
-            print(f"  - Value: {repr(offset_attr)}")
-            
             def get_scalar(attr_name):
-                val = ds.attrs[attr_name]
-                print(f"  [get_scalar] Initial value for '{attr_name}': {repr(val)} (type: {type(val)})")
-                while isinstance(val, (list, tuple, np.ndarray)):
-                    if len(val) == 0:
-                        raise ValueError(f"Calibration coefficient {attr_name} is an empty sequence.")
-                    val = val[0]
-                    print(f"  [get_scalar] Unwrapped to: {repr(val)} (type: {type(val)})")
-                return float(val)
+                return np.asarray(ds.attrs[attr_name]).item()
 
             gain = get_scalar('DN_to_Radiance_Gain')
             offset = get_scalar('DN_to_Radiance_Offset')
-
-            print("\n[DEBUG] Processed scalar coefficients:")
-            print(f"  - Gain: {gain} (type: {type(gain)})")
-            print(f"  - Offset: {offset} (type: {type(offset)})")
-
-            print("\n[DEBUG] Attempting multiplication: radiance = dn_variable * gain + offset")
-            radiance = dn_variable * gain + offset
-            radiance.attrs['units'] = 'W m-2 sr-1 um-1'
-            print("[DEBUG] DN to Radiance conversion successful.")
             
-            # --- Channel-Specific Calibration ---
+            dn_array = ds['image_pixel_values'].data
+            radiance_array = dn_array * gain + offset
+            
+            radiance = xr.DataArray(
+                radiance_array,
+                coords=ds['image_pixel_values'].coords,
+                dims=ds['image_pixel_values'].dims,
+                attrs={'units': 'W m-2 sr-1 um-1'}
+            )
+            
             channel_type = product_name[:2]
 
             if channel_type in ['vi', 'nr']:
@@ -132,10 +103,11 @@ class Gk2aDataFetcher:
                 c_light = get_scalar('light_speed')
                 lambda_c = get_scalar('channel_center_wavelength') * 1e-6
                 
-                c1_planck = 2 * h * c_light**2
-                c2_planck = (h * c_light) / k
-                wavenumber_m = (1 / lambda_c)
-                teff = (c2_planck * wavenumber_m) / np.log(1 + (c1_planck * wavenumber_m**3) / radiance)
+                c1 = 2 * h * c_light**2
+                c2 = (h * c_light) / k
+                radiance_per_meter = radiance * 1e6
+                term_in_log = (c1 / (radiance_per_meter * (lambda_c**5))) + 1.0
+                teff = c2 / (lambda_c * np.log(term_in_log))
 
                 c0 = get_scalar('Teff_to_Tbb_c0')
                 c1_t = get_scalar('Teff_to_Tbb_c1')
@@ -146,16 +118,10 @@ class Gk2aDataFetcher:
                 tbb.attrs['units'] = 'K'
                 ds['brightness_temperature'] = tbb
 
-            print(f"--- Calibration successful for {product_name} ---")
             return ds
 
         except Exception as e:
-            print(f"\n---!!! CALIBRATION FAILED for {product_name} !!!---", file=sys.stderr)
-            print(f"ERROR MESSAGE: {e}", file=sys.stderr)
-            print("\n--- Full Stack Trace ---", file=sys.stderr)
-            traceback.print_exc()
-            print("------------------------", file=sys.stderr)
-            print("Returning uncalibrated data.", file=sys.stderr)
+            print(f"WARNING: Could not calibrate dataset for {product_name}. Error: {e}", file=sys.stderr)
             return ds
 
 
@@ -175,41 +141,25 @@ class Gk2aDataFetcher:
     def _find_files(self, sensor, product, start_time, end_time, area=None):
         all_files = []
         prefixes = list(self._generate_s3_prefixes(sensor, product, start_time, end_time, area))
-        print(f"[INFO] Generated {len(prefixes)} prefixes to search.")
         for prefix in prefixes:
             s3_objects = self.s3_utils.list_files_in_prefix(prefix)
             for obj in s3_objects:
                 filename = os.path.basename(obj['Key'])
-                print(f"\n[DEBUG] Checking S3 object: {filename}")
-                
                 parsed_data = GK2ADefs.parse_filename(filename)
                 
-                # Check 1: Was the filename parsed at all?
-                if not parsed_data:
-                    print("[DEBUG] FILTER FAIL: Filename did not match expected pattern.")
+                if not parsed_data: 
                     continue
                 
-                print(f"[DEBUG] Parsed data: {parsed_data}")
-
-                # Check 2: Does the parsed data contain a valid datetime?
                 file_time = parsed_data.get('datetime')
                 if not file_time:
-                    print(f"[DEBUG] FILTER FAIL: Could not parse a valid datetime from the filename.")
                     continue
-                
-                print(f"[DEBUG] Parsed datetime: {file_time}")
+                    
+                if not (start_time <= file_time <= end_time): 
+                    continue
 
-                # Check 3: Is the file within the requested time range?
-                if not (start_time <= file_time <= end_time):
-                    print(f"[DEBUG] FILTER FAIL: File time {file_time} is outside the range {start_time} - {end_time}.")
-                    continue
-                
-                print("[DEBUG] FILTER PASS: File is within the time range.")
                 parsed_data['s3_key'] = obj['Key']
                 all_files.append(parsed_data)
-        
         all_files.sort(key=lambda x: x.get('datetime', datetime.min))
-        print(f"[INFO] Found {len(all_files)} matching files.")
         return all_files
     
     def _load_as_xarray(self, s3_path):
