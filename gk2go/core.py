@@ -74,40 +74,57 @@ class Gk2aDataFetcher:
         """
         print(f"--- Entering Calibration for {product_name} ---")
         try:
-            # --- Definitive helper to get a scalar value ---
-            # This robustly handles scalars, and any level of nested
-            # lists, tuples, or numpy arrays containing a single value by
-            # forcing the attribute to a numpy array and then calling .item().
-            def get_scalar(attr_name):
-                return np.asarray(ds.attrs[attr_name]).item()
+            # --- Extensive Debugging Prints ---
+            dn_variable = ds['image_pixel_values']
+            gain_attr = ds.attrs['DN_to_Radiance_Gain']
+            offset_attr = ds.attrs['DN_to_Radiance_Offset']
 
-            # --- Common Step: DN to Radiance ---
+            print(f"\n[DEBUG] Raw 'image_pixel_values' info:")
+            print(f"  - Type: {type(dn_variable)}")
+            print(f"  - Shape: {dn_variable.shape}")
+            print(f"  - Dtype: {dn_variable.dtype}")
+            print(f"  - Underlying data type: {type(dn_variable.data)}")
+
+
+            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Gain' attribute info:")
+            print(f"  - Type: {type(gain_attr)}")
+            print(f"  - Value: {repr(gain_attr)}")
+            
+            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Offset' attribute info:")
+            print(f"  - Type: {type(offset_attr)}")
+            print(f"  - Value: {repr(offset_attr)}")
+            
+            def get_scalar(attr_name):
+                val = ds.attrs[attr_name]
+                while isinstance(val, (list, tuple, np.ndarray)):
+                    if len(val) == 0:
+                        raise ValueError(f"Calibration coefficient {attr_name} is an empty sequence.")
+                    val = val[0]
+                return float(val)
+
             gain = get_scalar('DN_to_Radiance_Gain')
             offset = get_scalar('DN_to_Radiance_Offset')
 
-            # Operate on the raw dask/numpy array to avoid potential xarray overhead issues
-            dn_array = ds['image_pixel_values'].data
-            radiance_array = dn_array * gain + offset
-            
-            radiance = xr.DataArray(
-                radiance_array,
-                coords=ds['image_pixel_values'].coords,
-                dims=ds['image_pixel_values'].dims,
-                attrs={'units': 'W m-2 sr-1 um-1'}
-            )
+            print("\n[DEBUG] Processed scalar coefficients:")
+            print(f"  - Gain: {gain} (type: {type(gain)})")
+            print(f"  - Offset: {offset} (type: {type(offset)})")
+
+            print("\n[DEBUG] Attempting multiplication: radiance = dn * gain + offset")
+            radiance = dn_variable * gain + offset
+            radiance.attrs['units'] = 'W m-2 sr-1 um-1'
             print("[DEBUG] DN to Radiance conversion successful.")
             
             # --- Channel-Specific Calibration ---
             channel_type = product_name[:2]
 
-            if channel_type in ['vi', 'nr']: # Visible & Near-IR -> Albedo
+            if channel_type in ['vi', 'nr']:
                 c = get_scalar('Radiance_to_Albedo_c')
                 albedo = radiance * c * 100
                 albedo.attrs['long_name'] = 'Albedo'
                 albedo.attrs['units'] = '%'
                 ds['albedo'] = albedo
                 
-            elif channel_type in ['sw', 'ir', 'wv']: # IR/WV -> Brightness Temp
+            elif channel_type in ['sw', 'ir', 'wv']:
                 h = get_scalar('Plank_constant_h')
                 k = get_scalar('Boltzmann_constant_k')
                 c_light = get_scalar('light_speed')
