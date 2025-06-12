@@ -35,7 +35,7 @@ class GK2ADefs:
         if ami_match:
             data = ami_match.groupdict()
             try:
-                data['datetime'] = datetime.strptime(data['timestamp'], '%Ym%d%H%M')
+                data['datetime'] = datetime.strptime(data['timestamp'], '%Y%m%d%H%M')
             except ValueError:
                 data['datetime'] = None
             return data
@@ -72,18 +72,35 @@ class Gk2aDataFetcher:
         """
         Calibrates the raw data in the dataset to scientific units.
         """
-        print(f"Calibrating data for {product_name}...")
+        print(f"--- Entering Calibration for {product_name} ---")
         try:
+            # --- Definitive helper to get a scalar value ---
             def get_scalar(attr_name):
-                return np.asarray(ds.attrs[attr_name]).item()
+                val = ds.attrs[attr_name]
+                print(f"  [get_scalar] Initial value for '{attr_name}': {repr(val)} (type: {type(val)})")
+                while isinstance(val, (list, tuple, np.ndarray)):
+                    if len(val) == 0:
+                        raise ValueError(f"Calibration coefficient {attr_name} is an empty sequence.")
+                    val = val[0]
+                    print(f"  [get_scalar] Unwrapped to: {repr(val)} (type: {type(val)})")
+                return float(val)
 
             gain = get_scalar('DN_to_Radiance_Gain')
             offset = get_scalar('DN_to_Radiance_Offset')
-            radiance = ds['image_pixel_values'] * gain + offset
-            radiance.attrs['units'] = 'W m-2 sr-1 um-1'
+            
+            # Explicitly operate on the underlying numpy/dask array
+            dn_array = ds['image_pixel_values'].data
+            radiance_array = dn_array * gain + offset
+            
+            radiance = xr.DataArray(
+                radiance_array,
+                coords=ds['image_pixel_values'].coords,
+                dims=ds['image_pixel_values'].dims,
+                attrs={'units': 'W m-2 sr-1 um-1'}
+            )
+            print("[DEBUG] DN to Radiance conversion successful.")
             
             channel_type = product_name[:2]
-
             if channel_type in ['vi', 'nr']:
                 c = get_scalar('Radiance_to_Albedo_c')
                 albedo = radiance * c * 100
@@ -97,14 +114,9 @@ class Gk2aDataFetcher:
                 c_light = get_scalar('light_speed')
                 lambda_c = get_scalar('channel_center_wavelength') * 1e-6
                 
-                # Correctly define Planck constants
-                c1 = 2 * h * c_light**2
-                c2 = (h * c_light) / k
-
-                # Convert radiance from "per micrometer" to "per meter" for calculation
+                c1_planck = 2 * h * c_light**2
+                c2_planck = (h * c_light) / k
                 radiance_per_meter = radiance * 1e6
-
-                # Use the wavelength form of the Planck function inversion
                 term_in_log = (c1 / (radiance_per_meter * (lambda_c**5))) + 1.0
                 teff = c2 / (lambda_c * np.log(term_in_log))
 
@@ -117,12 +129,16 @@ class Gk2aDataFetcher:
                 tbb.attrs['units'] = 'K'
                 ds['brightness_temperature'] = tbb
 
-            print(f"Calibration successful.")
+            print(f"--- Calibration successful for {product_name} ---")
             return ds
 
         except Exception as e:
-            print(f"WARNING: Could not calibrate dataset for {product_name}. Error: {e}", file=sys.stderr)
+            print(f"\n---!!! CALIBRATION FAILED for {product_name} !!!---", file=sys.stderr)
+            print(f"ERROR MESSAGE: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            print("------------------------", file=sys.stderr)
             return ds
+
 
     @staticmethod
     def _generate_s3_prefixes(sensor, product, start_time, end_time, area=None):
@@ -140,16 +156,41 @@ class Gk2aDataFetcher:
     def _find_files(self, sensor, product, start_time, end_time, area=None):
         all_files = []
         prefixes = list(self._generate_s3_prefixes(sensor, product, start_time, end_time, area))
+        print(f"[INFO] Generated {len(prefixes)} prefixes to search.")
         for prefix in prefixes:
             s3_objects = self.s3_utils.list_files_in_prefix(prefix)
             for obj in s3_objects:
                 filename = os.path.basename(obj['Key'])
+                print(f"\n[DEBUG] Checking S3 object: {filename}")
+                
                 parsed_data = GK2ADefs.parse_filename(filename)
-                if not parsed_data: continue
-                if not (start_time <= parsed_data.get('datetime', start_time - timedelta(seconds=1)) <= end_time): continue
+                
+                # Check 1: Was the filename parsed at all?
+                if not parsed_data:
+                    print("[DEBUG] FILTER FAIL: Filename did not match expected pattern.")
+                    continue
+                
+                print(f"[DEBUG] Parsed data: {parsed_data}")
+
+                # Check 2: Does the parsed data contain a valid datetime?
+                file_time = parsed_data.get('datetime')
+                if not file_time:
+                    print(f"[DEBUG] FILTER FAIL: Could not parse a valid datetime from the filename.")
+                    continue
+                
+                print(f"[DEBUG] Parsed datetime: {file_time}")
+
+                # Check 3: Is the file within the requested time range?
+                if not (start_time <= file_time <= end_time):
+                    print(f"[DEBUG] FILTER FAIL: File time {file_time} is outside the range {start_time} - {end_time}.")
+                    continue
+                
+                print("[DEBUG] FILTER PASS: File is within the time range.")
                 parsed_data['s3_key'] = obj['Key']
                 all_files.append(parsed_data)
+        
         all_files.sort(key=lambda x: x.get('datetime', datetime.min))
+        print(f"[INFO] Found {len(all_files)} matching files.")
         return all_files
     
     def _load_as_xarray(self, s3_path):
