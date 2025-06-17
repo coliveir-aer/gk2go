@@ -170,7 +170,7 @@ class Gk2aDataFetcher:
         """Initializes the Gk2aDataFetcher with an S3 utility instance."""
         self.s3_utils = S3Utils()
 
-    def _calibrate(self, ds, product_name):
+    def _calibrate(self, ds, product_name, debug=False):
         """
         Calibrates raw data in the xarray.Dataset to scientific units.
 
@@ -188,33 +188,37 @@ class Gk2aDataFetcher:
                              and necessary calibration coefficients as attributes.
             product_name (str): The product identifier (e.g., 'vi004', 'ir133')
                                  which determines the calibration path.
+            debug (bool, optional): If True, enables detailed debug logging.
+                                    Defaults to False.
 
         Returns:
             xr.Dataset: The dataset with a new calibrated data variable
                         ('albedo' or 'brightness_temperature') added. Returns the
                         original dataset if calibration fails.
         """
-        print(f"--- Entering Calibration for {product_name} ---")
+        if debug:
+            print(f"--- Entering Calibration for {product_name} ---")
         try:
             # --- Extensive Debugging Prints ---
             dn_variable = ds['image_pixel_values']
             gain_attr = ds.attrs.get('DN_to_Radiance_Gain', 'N/A')
             offset_attr = ds.attrs.get('DN_to_Radiance_Offset', 'N/A')
 
-            print(f"\n[DEBUG] Raw 'image_pixel_values' info:")
-            print(f"  - Type: {type(dn_variable)}")
-            print(f"  - Shape: {dn_variable.shape}")
-            print(f"  - Dtype: {dn_variable.dtype}")
-            print(f"  - Underlying data type: {type(dn_variable.data)}")
+            if debug:
+                print(f"\n[DEBUG] Raw 'image_pixel_values' info:")
+                print(f"  - Type: {type(dn_variable)}")
+                print(f"  - Shape: {dn_variable.shape}")
+                print(f"  - Dtype: {dn_variable.dtype}")
+                print(f"  - Underlying data type: {type(dn_variable.data)}")
 
 
-            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Gain' attribute info:")
-            print(f"  - Type: {type(gain_attr)}")
-            print(f"  - Value: {repr(gain_attr)}")
+                print(f"\n[DEBUG] Raw 'DN_to_Radiance_Gain' attribute info:")
+                print(f"  - Type: {type(gain_attr)}")
+                print(f"  - Value: {repr(gain_attr)}")
 
-            print(f"\n[DEBUG] Raw 'DN_to_Radiance_Offset' attribute info:")
-            print(f"  - Type: {type(offset_attr)}")
-            print(f"  - Value: {repr(offset_attr)}")
+                print(f"\n[DEBUG] Raw 'DN_to_Radiance_Offset' attribute info:")
+                print(f"  - Type: {type(offset_attr)}")
+                print(f"  - Value: {repr(offset_attr)}")
 
             def get_scalar(attr_name):
                 """
@@ -222,13 +226,15 @@ class Gk2aDataFetcher:
                 Handles attributes that might be lists, tuples, or numpy arrays.
                 """
                 val = ds.attrs[attr_name]
-                print(f"  [get_scalar] Initial value for '{attr_name}': {repr(val)} (type: {type(val)})")
+                if debug:
+                    print(f"  [get_scalar] Initial value for '{attr_name}': {repr(val)} (type: {type(val)})")
                 # Some files store coefficients in a list/array, extract the first element.
                 while isinstance(val, (list, tuple, np.ndarray)):
                     if len(val) == 0:
                         raise ValueError(f"Calibration coefficient {attr_name} is an empty sequence.")
                     val = val[0]
-                    print(f"  [get_scalar] Unwrapped to: {repr(val)} (type: {type(val)})")
+                    if debug:
+                        print(f"  [get_scalar] Unwrapped to: {repr(val)} (type: {type(val)})")
                 # Ensure the final value is a float.
                 return float(val)
 
@@ -236,14 +242,16 @@ class Gk2aDataFetcher:
             gain = get_scalar('DN_to_Radiance_Gain')
             offset = get_scalar('DN_to_Radiance_Offset')
 
-            print("\n[DEBUG] Processed scalar coefficients:")
-            print(f"  - Gain: {gain} (type: {type(gain)})")
-            print(f"  - Offset: {offset} (type: {type(offset)})")
+            if debug:
+                print("\n[DEBUG] Processed scalar coefficients:")
+                print(f"  - Gain: {gain} (type: {type(gain)})")
+                print(f"  - Offset: {offset} (type: {type(offset)})")
 
-            print("\n[DEBUG] Attempting multiplication: radiance = dn_variable * gain + offset")
+                print("\n[DEBUG] Attempting multiplication: radiance = dn_variable * gain + offset")
             radiance = dn_variable * gain + offset
             radiance.attrs['units'] = 'W m-2 sr-1 um-1' # Note: This is radiance per-micrometer
-            print("[DEBUG] DN to Radiance conversion successful.")
+            if debug:
+                print("[DEBUG] DN to Radiance conversion successful.")
 
             # --- Channel-Specific Calibration ---
             channel_type = product_name[:2]  # e.g., 'vi', 'nr', 'sw', 'ir', 'wv'
@@ -257,7 +265,8 @@ class Gk2aDataFetcher:
                 albedo.attrs['long_name'] = 'Albedo'
                 albedo.attrs['units'] = '%'
                 ds['albedo'] = albedo
-                print(f"[DEBUG] Albedo: {albedo.min().compute().item():.2f}% to {albedo.max().compute().item():.2f}%")
+                if debug:
+                    print(f"[DEBUG] Albedo: {albedo.min().compute().item():.2f}% to {albedo.max().compute().item():.2f}%")
 
 
             elif channel_type in ['sw', 'ir', 'wv']: # Thermal channels
@@ -273,11 +282,13 @@ class Gk2aDataFetcher:
                 # Calculate wavenumber (wn) in m^-1.
                 # The channel_center_wavelength is in micrometers (um).
                 wn = (10000.0 / get_scalar('channel_center_wavelength')) * 100.0
-                print(f"[DEBUG] Calculated Wavenumber (wn): {wn} (m^-1)")
+                if debug:
+                    print(f"[DEBUG] Calculated Wavenumber (wn): {wn} (m^-1)")
 
                 # Convert radiance to units required by the Planck function formula.
                 radiance_for_planck = positive_radiance * 1e-5
-                print(f"[DEBUG] Radiance for Planck (radiance_for_planck): {radiance_for_planck.min().compute().item():.3e} to {radiance_for_planck.max().compute().item():.3e}")
+                if debug:
+                    print(f"[DEBUG] Radiance for Planck (radiance_for_planck): {radiance_for_planck.min().compute().item():.3e} to {radiance_for_planck.max().compute().item():.3e}")
 
                 # Inverse Planck function to get Effective Temperature (Teff)
                 e1 = (2.0 * hval * cval * cval) * np.power(wn, 3.0)
@@ -288,7 +299,8 @@ class Gk2aDataFetcher:
                 term_in_log = term_in_log.where(term_in_log > 0)
 
                 teff = ((hval * cval / kval) * wn) / np.log(term_in_log)
-                print(f"[DEBUG] Effective Temperature (teff): {teff.min().compute().item():.2f} K to {teff.max().compute().item():.2f} K")
+                if debug:
+                    print(f"[DEBUG] Effective Temperature (teff): {teff.min().compute().item():.2f} K to {teff.max().compute().item():.2f} K")
 
 
                 # Apply standard polynomial correction to get Brightness Temperature (Tbb)
@@ -300,9 +312,11 @@ class Gk2aDataFetcher:
                 tbb.attrs['long_name'] = 'Brightness Temperature'
                 tbb.attrs['units'] = 'K'
                 ds['brightness_temperature'] = tbb
-                print(f"[DEBUG] Brightness Temperature (tbb): {tbb.min().compute().item():.2f} K to {tbb.max().compute().item():.2f} K")
+                if debug:
+                    print(f"[DEBUG] Brightness Temperature (tbb): {tbb.min().compute().item():.2f} K to {tbb.max().compute().item():.2f} K")
 
-            print(f"--- Calibration successful for {product_name} ---")
+            if debug:
+                print(f"--- Calibration successful for {product_name} ---")
             return ds
 
         except Exception as e:
@@ -503,7 +517,7 @@ class Gk2aDataFetcher:
             print(f"ERROR: Could not open S3 object {s3_path} as xarray.Dataset: {e}", file=sys.stderr)
             return None
 
-    def get_data(self, sensor, product, area, query_type='latest', target_time=None, start_time=None, end_time=None, calibrate=False, geolocation_enabled=False):
+    def get_data(self, sensor, product, area, query_type='latest', target_time=None, start_time=None, end_time=None, calibrate=False, geolocation_enabled=False, debug=False):
         """
         Fetches GK-2A data based on specified criteria.
 
@@ -527,6 +541,8 @@ class Gk2aDataFetcher:
                 loaded data. Defaults to False.
             geolocation_enabled (bool, optional): If True, adds latitude and
                 longitude coordinates to the dataset. Defaults to False.
+            debug (bool, optional): If True, enables debug logging for calibration.
+                                    Defaults to False.
 
         Returns:
             xr.Dataset or None: An xarray.Dataset containing the requested data.
@@ -549,7 +565,7 @@ class Gk2aDataFetcher:
             if not ds: return None
             
             if calibrate:
-                ds = self._calibrate(ds, product)
+                ds = self._calibrate(ds, product, debug=debug) # Pass debug here
             if geolocation_enabled: # Call geolocation if flag is True
                 ds = self._add_geolocation(ds, area, product) # Pass product to _add_geolocation
             # Add a time dimension to the dataset for consistency.
@@ -569,7 +585,7 @@ class Gk2aDataFetcher:
             if not ds: return None
             
             if calibrate:
-                ds = self._calibrate(ds, product)
+                ds = self._calibrate(ds, product, debug=debug) # Pass debug here
             if geolocation_enabled: # Call geolocation if flag is True
                 ds = self._add_geolocation(ds, area, product) # Pass product to _add_geolocation
             return ds.expand_dims(time=[nearest_file['datetime']])
@@ -589,7 +605,7 @@ class Gk2aDataFetcher:
                     main_var = next(iter(ds.data_vars))
                     ds_clean = ds[[main_var]]
                     if calibrate:
-                        ds_clean = self._calibrate(ds, product)
+                        ds_clean = self._calibrate(ds, product, debug=debug) # Pass debug here
                     if geolocation_enabled: # Call geolocation if flag is True
                         ds_clean = self._add_geolocation(ds_clean, area, product) # Pass product to _add_geolocation
                     # Add time dimension before appending for concatenation.
