@@ -175,7 +175,24 @@ class GK2ADefs:
     Defines constants and static methods for GK-2A data, including S3 bucket details,
     product types, and helper functions for parsing filenames and attributes.
     """
+    # Regex to parse the standard GK-2A AMI LE1B filename format.
+    # It captures key metadata components like satellite, sensor, product, area,
+    # resolution, and timestamp.
+    AMI_FILENAME_RE = re.compile(
+        r"^(?P<satellite>gk2a)_"
+        r"(?P<sensor>ami)_"
+        r"(?P<level>le1b)_"
+        r"(?P<product>[a-z]{2}\d{3})_"
+        r"(?P<area>fd|la)"
+        r"(?P<resolution>\d{3})"
+        r"(?P<projection>ge)_"
+        r"(?P<timestamp>\d{12})\."
+        r"(?P<format>nc|png)$"
+    )
+    # The public S3 bucket hosting the NOAA GK-2A PDS.
     S3_BUCKET = "noaa-gk2a-pds"
+    # The AWS region where the S3 bucket is located.
+    AWS_REGION = "us-east-1"
 
     # GK2A sensor (AMI) product types and areas
     AMI_PRODUCTS = [
@@ -208,28 +225,26 @@ class GK2ADefs:
     )
 
     @staticmethod
-    def parse_s3_key(s3_key):
+    def parse_filename(filename):
         """
-        Parses an S3 object key (filename) to extract GK2A metadata.
+        Parses a GK-2A AMI filename to extract metadata.
         Args:
-            s3_key (str): The full S3 object key (e.g., AMI/L1B/FD/202506/01/00/gk2a_ami_le1b_ir087_fd020ge_202506010000.nc)
+            filename (str): The filename to parse.
         Returns:
-            dict or None: A dictionary containing parsed metadata (sensor, area, product, datetime)
-                          or None if the key does not match the expected pattern.
+            dict: A dictionary containing the parsed components of the filename,
+                  including a 'datetime' object. Returns None if the filename
+                  does not match the expected format.
         """
-        filename = os.path.basename(s3_key)
-        match = GK2ADefs.GK2A_FILENAME_PATTERN.match(filename)
-        if match:
-            data = match.groupdict()
+        ami_match = GK2ADefs.AMI_FILENAME_RE.match(filename)
+        if ami_match:
+            data = ami_match.groupdict()
             try:
-                data['datetime'] = datetime(
-                    int(data['year']), int(data['month']), int(data['day']),
-                    int(data['hour']), int(data['minute'])
-                )
-                data['s3_key'] = s3_key # Store the full S3 key
-                return data
+                # Convert the timestamp string into a Python datetime object.
+                data['datetime'] = datetime.strptime(data['timestamp'], '%Y%m%d%H%M')
             except ValueError:
-                return None
+                # Handle cases where the timestamp is not a valid date.
+                data['datetime'] = None
+            return data
         return None
 
     @staticmethod
@@ -302,29 +317,80 @@ class Gk2aDataFetcher:
             return f"{base_prefix}/{dt.strftime('%Y%m')}/{dt.strftime('%d')}/{dt.strftime('%H')}/"
         return base_prefix + "/" # For listing all files in an area
 
-    def _find_files(self, sensor, product, start_time, end_time, area, debug=False):
+    @staticmethod
+    def _generate_s3_prefixes(sensor, product, start_time, end_time, area=None):
         """
-        Finds available GK2A NetCDF files within a specified time range.
-        Optimized to search only relevant daily/hourly prefixes.
+        Generates the S3 prefixes to search for files within a time range.
+        The GK-2A S3 bucket is organized by .../YYYYMM/DD/HH/. This method
+        iterates through each hour in the specified time range and yields the
+        corresponding S3 prefix.
+        Args:
+            sensor (str): The sensor name (e.g., 'ami').
+            product (str): The product identifier (e.g., 'vi004').
+            start_time (datetime): The beginning of the time range.
+            end_time (datetime): The end of the time range.
+            area (str): The geographic area (e.g., 'fd', 'ela', 'la').
+        Yields:
+            str: An S3 prefix string for a specific hour.
+        Raises:
+            ValueError: If 'area' is not provided.
         """
-        found_files = []
+        if not area:
+            raise ValueError("The 'area' parameter is required for L1B data.")
+        base_prefix = f"{sensor.upper()}/L1B/{area.upper()}/"
         current_time = start_time
-        # Iterate hour by hour to build prefixes more accurately
         while current_time <= end_time:
-            hourly_prefix = self._get_s3_prefix(sensor, area, product, dt=current_time)
-            if debug:
-                print(f"Searching S3 prefix: {self.s3_bucket}/{hourly_prefix}", file=sys.stderr)
-            s3_keys = self.s3_utils.list_s3_objects(self.s3_bucket, hourly_prefix, debug=debug)
+            time_path = current_time.strftime(f"%Y%m/%d/%H/")
+            filename_prefix = f"gk2a_{sensor.lower()}_le1b_{product.lower()}_{area.lower()}"
+            full_prefix = f"{base_prefix}{time_path}{filename_prefix}"
+            yield full_prefix
+            current_time += timedelta(hours=1)
 
-            for key in s3_keys:
-                parsed_data = GK2ADefs.parse_s3_key(key)
-                if parsed_data and parsed_data['sensor'] == sensor and \
-                   parsed_data['product'] == product and parsed_data['area'] == area:
-                    if start_time <= parsed_data['datetime'] <= end_time:
-                        found_files.append(parsed_data)
-            current_time += timedelta(hours=1) # Increment by hour
-        # Sort by datetime to ensure consistency for 'range' queries
-        return sorted(found_files, key=lambda x: x['datetime'])
+    def _find_files(self, sensor, product, start_time, end_time, area=None, debug=False):
+        """
+        Finds all relevant data files within a specified time range.
+
+        This method queries S3 using the prefixes generated by
+        _generate_s3_prefixes, filters the results to match the exact time
+        window, parses the filenames, and returns a sorted list of file metadata.
+
+        Args:
+            sensor (str): The sensor name.
+            product (str): The product identifier.
+            start_time (datetime): The start of the time range.
+            end_time (datetime): The end of the time range.
+            area (str): The geographic area.
+
+        Returns:
+            list[dict]: A sorted list of dictionaries, where each dictionary
+                        contains parsed metadata for a found file. Returns an
+                        empty list if no files are found.
+        """
+        all_files = []
+        prefixes = list(self._generate_s3_prefixes(sensor, product, start_time, end_time, area))
+        for prefix in prefixes:
+            s3_objects = self.s3_utils.list_files_in_prefix(prefix)
+            for obj in s3_objects:
+                filename = os.path.basename(obj['Key'])
+                parsed_data = GK2ADefs.parse_filename(filename)
+
+                if not parsed_data:
+                    continue
+
+                file_time = parsed_data.get('datetime')
+                if not file_time:
+                    continue
+
+                # Final check to ensure file is within the precise time range.
+                if not (start_time <= file_time <= end_time):
+                    continue
+
+                parsed_data['s3_key'] = obj['Key']
+                all_files.append(parsed_data)
+
+        # Sort files chronologically.
+        all_files.sort(key=lambda x: x.get('datetime', datetime.min))
+        return all_files
 
     def _load_as_xarray(self, s3_path, debug=False):
         """
