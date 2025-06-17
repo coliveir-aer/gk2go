@@ -40,7 +40,6 @@ from dateutil.parser import parse as parse_date
 import numpy as np
 
 
-# --- Earth Constants (GLOBAL in module, consistent with planet definitions) ---
 class EarthConstants:
     """Defines constants for Earth's dimensions for geolocation calculations."""
     RP = 6356.75231414  # Radius of Earth across Poles (WGS84 semi-minor axis) in km
@@ -188,11 +187,11 @@ class GK2ADefs:
     AMI_AREAS = ['fd', 'la']
 
     # Regex pattern to parse GK2A Level 1B filenames
-    # Example: gk2a_ami_le1b_fd_ir087_20240101_000000.nc
+    # Example: gk2a_ami_le1b_ir087_fd020ge_202506010000.nc
     GK2A_FILENAME_PATTERN = re.compile(
         r'gk2a_(?P<sensor>ami|ksem)_le1b_(?P<area>[a-z]+)_(?P<product>[a-z0-9]+)_'
         r'(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})_'
-        r'(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})\.nc$'
+        r'(?P<hour>\d{2})(?P<minute>\d{2})\.nc$'
     )
 
     @staticmethod
@@ -200,7 +199,7 @@ class GK2ADefs:
         """
         Parses an S3 object key (filename) to extract GK2A metadata.
         Args:
-            s3_key (str): The full S3 object key (e.g., L1B/FD/2024/01/gk2a_ami_le1b_fd_ir087_20240101_000000.nc)
+            s3_key (str): The full S3 object key (e.g., AMI/L1B/FD/202506/01/00/gk2a_ami_le1b_ir087_fd020ge_202506010000.nc)
         Returns:
             dict or None: A dictionary containing parsed metadata (sensor, area, product, datetime)
                           or None if the key does not match the expected pattern.
@@ -212,7 +211,7 @@ class GK2ADefs:
             try:
                 data['datetime'] = datetime(
                     int(data['year']), int(data['month']), int(data['day']),
-                    int(data['hour']), int(data['minute']), int(data['second'])
+                    int(data['hour']), int(data['minute'])
                 )
                 data['s3_key'] = s3_key # Store the full S3 key
                 return data
@@ -280,26 +279,27 @@ class Gk2aDataFetcher:
     def _get_s3_prefix(self, sensor, area, product, dt=None):
         """
         Constructs the S3 prefix path based on sensor, area, product, and optional datetime.
+        Now follows YYYYMM/DD/HH structure.
         """
-        base_prefix = f"L1B/{area.upper()}"
+        base_prefix = f"{sensor}.upper()/L1B/{area.upper()}"
         if dt:
-            # Example path: L1B/FD/2024/001/
-            return f"{base_prefix}/{dt.year}/{dt.strftime('%j')}/"
+            # Construct path as L1B/{AREA}/{YYYYMM}/{DD}/{HH}/
+            return f"{base_prefix}/{dt.strftime('%Y%m')}/{dt.strftime('%d')}/{dt.strftime('%H')}/"
         return base_prefix + "/" # For listing all files in an area
 
     def _find_files(self, sensor, product, start_time, end_time, area, debug=False):
         """
         Finds available GK2A NetCDF files within a specified time range.
-        Optimized to search only relevant daily prefixes.
+        Optimized to search only relevant daily/hourly prefixes.
         """
         found_files = []
         current_time = start_time
-        # Iterate day by day
+        # Iterate hour by hour to build prefixes more accurately
         while current_time <= end_time:
-            daily_prefix = self._get_s3_prefix(sensor, area, product, dt=current_time)
+            hourly_prefix = self._get_s3_prefix(sensor, area, product, dt=current_time)
             if debug:
-                print(f"Searching S3 prefix: {self.s3_bucket}/{daily_prefix}", file=sys.stderr)
-            s3_keys = self.s3_utils.list_s3_objects(self.s3_bucket, daily_prefix, debug=debug)
+                print(f"Searching S3 prefix: {self.s3_bucket}/{hourly_prefix}", file=sys.stderr)
+            s3_keys = self.s3_utils.list_s3_objects(self.s3_bucket, hourly_prefix, debug=debug)
 
             for key in s3_keys:
                 parsed_data = GK2ADefs.parse_s3_key(key)
@@ -307,7 +307,7 @@ class Gk2aDataFetcher:
                    parsed_data['product'] == product and parsed_data['area'] == area:
                     if start_time <= parsed_data['datetime'] <= end_time:
                         found_files.append(parsed_data)
-            current_time += timedelta(days=1)
+            current_time += timedelta(hours=1) # Increment by hour
         # Sort by datetime to ensure consistency for 'range' queries
         return sorted(found_files, key=lambda x: x['datetime'])
 
@@ -446,7 +446,7 @@ class Gk2aDataFetcher:
                 earth_sun_distance = GK2ADefs.get_attr_scalar(ds, 'earth_sun_distance_correction_factor', debug=debug) # in AU
 
                 if solar_irradiance is not None and earth_sun_distance is not None:
-                    # Simplified scaling, actual albedo requires solar zenith angle, which means geolocation first.
+                    # Simplified scaling, actual albedo requires solar zenith angle, which needs geolocation first.
                     # For a quick fix, if we don't have SZA, we can't do full albedo.
                     # Let's just return radiance and note the limitation.
                     if debug:
