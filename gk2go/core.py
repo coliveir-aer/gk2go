@@ -87,7 +87,7 @@ def _compute_geos_latlon(image_width, image_height, resolution_km, satellite_hei
 
     # Adjust MRAD based on the current image's resolution relative to the 2km base.
     # A smaller `resolution_km` value (higher spatial resolution) means the sensor's
-    # instantaneous field of view (MRAD) for each pixel is proportionally smaller.
+    # instantaneous field of view (MRAD) is proportionally smaller for each pixel.
     if resolution_km == 0.5:
         MRAD = MRAD_2KM_BASE / 4.0
     elif resolution_km == 1.0:
@@ -263,7 +263,7 @@ class GK2ADefs:
                 if debug:
                     print(f"Warning: Attribute '{attr_name}' is an array with size > 1. Returning first element.", file=sys.stderr)
                 return value.flatten()[0].item()
-        return value
+        return value # Return value directly, don't force float conversion here
 
 
 class S3Utils:
@@ -591,28 +591,32 @@ class Gk2aDataFetcher:
             return ds
 
         # Extract necessary parameters from dataset attributes
-        # Ensure these attributes exist in the raw dataset
-        image_width = GK2ADefs.get_attr_scalar(ds, 'image_width', None, debug=debug)
-        image_height = GK2ADefs.get_attr_scalar(ds, 'image_height', None, debug=debug)
+        # Corrected attribute names based on the dataset info provided by user
+        image_width = GK2ADefs.get_attr_scalar(ds, 'number_of_columns', None, debug=debug)
+        image_height = GK2ADefs.get_attr_scalar(ds, 'number_of_lines', None, debug=debug)
         # Convert channel_spatial_resolution to float if it's a string
         resolution_km = float(GK2ADefs.get_attr_scalar(ds, 'channel_spatial_resolution', 2.0, debug=debug)) # Default to 2.0km if not found
 
         # Ensure these core attributes are available
         if image_width is None or image_height is None:
-            print("Error: 'image_width' or 'image_height' attributes not found in dataset. Cannot add geolocation.", file=sys.stderr)
+            print("Error: 'number_of_columns' or 'number_of_lines' attributes not found in dataset. Cannot add geolocation.", file=sys.stderr)
             return ds
 
         # GK2A specific satellite parameters (constants in our GEOS implementation)
-        satellite_height_km = GK2ADefs.get_attr_scalar(ds, 'satellite_height', 42164.160, debug=debug) # Default value
-        sub_satellite_lon_deg = GK2ADefs.get_attr_scalar(ds, 'image_center_longitude', 128.2, debug=debug) # Default for GK2A
-
-        # Convert sub_satellite_lon_deg from radians to degrees if it's stored as radians in ds.attrs
-        # The image_center_longitude in GK2A datasets is often in radians.
-        # Check if attribute exists before accessing it
-        if 'image_center_longitude_units' in ds.attrs and ds.attrs['image_center_longitude_units'] == 'radians':
-             sub_satellite_lon_deg = np.rad2deg(sub_satellite_lon_deg)
-             if debug:
-                 print(f"[DEBUG Core Geoloc] Converted image_center_longitude from radians to degrees: {sub_satellite_lon_deg:.4f}", file=sys.stderr)
+        # 'nominal_satellite_height' is in meters, convert to km
+        satellite_height_m = GK2ADefs.get_attr_scalar(ds, 'nominal_satellite_height', 42164000.0, debug=debug) # Default value in meters
+        satellite_height_km = satellite_height_m / 1000.0 # Convert to kilometers
+        
+        # image_center_longitude (sub_longitude) is the satellite longitude, given in radians
+        # Need to convert to degrees before passing to _compute_geos_latlon
+        sub_satellite_lon_rad = GK2ADefs.get_attr_scalar(ds, 'image_center_longitude', None, debug=debug)
+        if sub_satellite_lon_rad is None:
+             # Fallback to 'sub_longitude' if 'image_center_longitude' is not found
+             sub_satellite_lon_rad = GK2ADefs.get_attr_scalar(ds, 'sub_longitude', np.deg2rad(128.2), debug=debug) # Default for GK2A in radians
+        
+        sub_satellite_lon_deg = np.rad2deg(sub_satellite_lon_rad)
+        if debug:
+             print(f"[DEBUG Core Geoloc] Sub-satellite longitude: {sub_satellite_lon_deg:.4f} degrees (from {sub_satellite_lon_rad} radians)", file=sys.stderr)
 
 
         if debug:
