@@ -353,26 +353,34 @@ class Gk2aDataFetcher:
 
         # Determine the dimension names for columns and lines in the dataset.
         # Common names are 'x', 'y' or 'col', 'row', or derived from image shape.
-        data_var_name = list(ds.data_vars.keys())[0] # Get the first data variable
-
-        column_dim = None
-        line_dim = None
-
-        if 'x' in ds[data_var_name].dims and 'y' in ds[data_var_name].dims:
-            column_dim = 'x'
-            line_dim = 'y'
-        elif 'column' in ds[data_var_name].dims and 'line' in ds[data_var_name].dims:
-            column_dim = 'column'
-            line_dim = 'line'
-        elif len(ds[data_var_name].dims) >= 2: # Fallback for generic 2D data (last two dims are spatial)
-            line_dim = ds[data_var_name].dims[-2]
-            column_dim = ds[data_var_name].dims[-1]
-        else:
-            print(f"Warning: Could not identify suitable 2D dimensions for geolocation in data variable '{data_var_name}' (expected 'x'/'y' or 'column'/'line'). Skipping geolocation.", file=sys.stderr)
+        # It's assumed 'image_pixel_values' is the main data variable,
+        # and its dimensions define the image shape.
+        data_var_name = 'image_pixel_values'
+        if data_var_name not in ds.data_vars:
+            print(f"Error: Expected data variable '{data_var_name}' not found in dataset. Cannot geolocate.", file=sys.stderr)
             return ds
 
-        columns = ds[column_dim].values
-        lines = ds[line_dim].values
+        column_dim_name = None
+        line_dim_name = None
+
+        # Try common dimension names for image data
+        if 'x' in ds[data_var_name].dims and 'y' in ds[data_var_name].dims:
+            column_dim_name = 'x'
+            line_dim_name = 'y'
+        # Check if the dimensions are named 'column' and 'line'
+        elif 'column' in ds[data_var_name].dims and 'line' in ds[data_var_name].dims:
+            column_dim_name = 'column'
+            line_dim_name = 'line'
+        # Fallback for generic 2D data: assume last two dimensions are (line, column)
+        elif len(ds[data_var_name].dims) >= 2:
+            line_dim_name = ds[data_var_name].dims[-2]
+            column_dim_name = ds[data_var_name].dims[-1]
+        else:
+            print(f"Warning: Could not identify suitable 2D dimensions for geolocation in data variable '{data_var_name}'. Expected 'x'/'y' or 'column'/'line', or at least 2 dimensions. Skipping geolocation.", file=sys.stderr)
+            return ds
+
+        columns = np.arange(ds[data_var_name].sizes[column_dim_name])
+        lines = np.arange(ds[data_var_name].sizes[line_dim_name])
 
         # Create a meshgrid for all pixels to get all (column, line) pairs
         cols_mesh, lines_mesh = np.meshgrid(columns, lines)
@@ -386,8 +394,8 @@ class Gk2aDataFetcher:
 
         # Add as new coordinates to the xarray dataset.
         # Ensure the dimensions match the original data's spatial dimensions.
-        ds = ds.assign_coords(latitude=((line_dim, column_dim), latitudes))
-        ds = ds.assign_coords(longitude=((line_dim, column_dim), longitudes))
+        ds = ds.assign_coords(latitude=((line_dim_name, column_dim_name), latitudes))
+        ds = ds.assign_coords(longitude=((line_dim_name, column_dim_name), longitudes))
 
         return ds
 
