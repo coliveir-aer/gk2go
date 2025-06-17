@@ -307,10 +307,8 @@ class Gk2aDataFetcher:
     def _get_s3_prefix(self, sensor, area, product, dt=None):
         """
         Constructs the S3 prefix path based on sensor, area, product, and optional datetime.
-        Now follows YYYYMM/DD/HH structure.
+        Now follows AMI/L1B/FD/YYYYMM/DD/HH structure.
         """
-        # //noaa-gk2a-pds/AMI/L1B/FD/202506/17/16/
-        # gk2a_ami_le1b_ir087_fd020ge_202506171650.nc
         base_prefix = f"{sensor.upper()}/L1B/{area.upper()}"
         if dt:
             # Construct path as L1B/{AREA}/{YYYYMM}/{DD}/{HH}/
@@ -369,9 +367,9 @@ class Gk2aDataFetcher:
         all_files = []
         prefixes = list(self._generate_s3_prefixes(sensor, product, start_time, end_time, area))
         for prefix in prefixes:
-            s3_objects = self.s3_utils.list_s3_objects(prefix)
-            for obj in s3_objects:
-                filename = os.path.basename(obj['Key'])
+            s3_objects = self.s3_utils.list_s3_objects(self.s3_bucket, prefix)
+            for obj_key in s3_objects: # obj_key is already the string key, not a dict
+                filename = os.path.basename(obj_key) # Corrected: Use obj_key directly
                 parsed_data = GK2ADefs.parse_filename(filename)
 
                 if not parsed_data:
@@ -385,7 +383,7 @@ class Gk2aDataFetcher:
                 if not (start_time <= file_time <= end_time):
                     continue
 
-                parsed_data['s3_key'] = obj['Key']
+                parsed_data['s3_key'] = obj_key # Corrected: Use obj_key directly
                 all_files.append(parsed_data)
 
         # Sort files chronologically.
@@ -400,8 +398,12 @@ class Gk2aDataFetcher:
             if debug:
                 print(f"Loading data from: {s3_path}", file=sys.stderr)
             # Use s3fs to open the file directly via xarray
+            # Use engine='h5netcdf' as these are NetCDF4 files, and 'scipy' often struggles.
             with self.s3_utils.s3_fs.open(s3_path, mode='rb') as f:
-                ds = xr.open_dataset(f, engine='netcdf4', decode_coords="all")
+                # Use 'h5netcdf' engine for NetCDF4 files, and allow lazy loading with 'chunks=auto'
+                ds = xr.open_dataset(f, engine='h5netcdf', decode_coords="all", chunks='auto')
+                # CRITICAL FIX: Force data to be loaded into memory before 'f' is closed
+                ds.load() 
             return ds
         except Exception as e:
             print(f"Error loading xarray dataset from {s3_path}: {e}", file=sys.stderr)
@@ -409,141 +411,166 @@ class Gk2aDataFetcher:
                 traceback.print_exc()
             return None
 
-    def _calibrate(self, ds, product, debug=False):
+    def _calibrate(self, ds, product_name, debug=False):
         """
-        Calibrates the raw image pixel values to radiance and then to
-        Brightness Temperature (for IR channels) or Albedo (for Visible channels).
+        Calibrates raw data in the xarray.Dataset to scientific units.
+
+        This internal method applies the appropriate calibration formulas based
+        on the channel type (Visible, Infrared, etc.). It converts the raw
+        'image_pixel_values' (Digital Numbers or DNs) into either Albedo (%)
+        for visible channels or Brightness Temperature (K) for thermal channels.
+
+        The method is designed to be robust, with extensive error handling and
+        debugging output to diagnose issues with metadata attributes. If
+        calibration fails, it returns the original, uncalibrated dataset.
+
+        Args:
+            ds (xr.Dataset): The input dataset containing the raw pixel values
+                             and necessary calibration coefficients as attributes.
+            product_name (str): The product identifier (e.g., 'vi004', 'ir133')
+                                which determines the calibration path.
+            debug (bool): If True, print debug messages.
+
+        Returns:
+            xr.Dataset: The dataset with a new calibrated data variable
+                        ('albedo' or 'brightness_temperature') added. Returns the
+                        original dataset if calibration fails.
         """
-        # Get raw image pixel values
-        dn_variable = ds['image_pixel_values'].squeeze() # Remove time dimension
-
         if debug:
-            print("[DEBUG] Raw 'image_pixel_values' info:", file=sys.stderr)
-            print(f"  - Type: {type(dn_variable)}", file=sys.stderr)
-            print(f"  - Shape: {dn_variable.shape}", file=sys.stderr)
-            print(f"  - Dtype: {dn_variable.dtype}", file=sys.stderr)
-            if hasattr(dn_variable.data, 'dask'):
-                print(f"  - Underlying data type: {type(dn_variable.data)}", file=sys.stderr)
-        
-        # Get calibration coefficients
-        gain = GK2ADefs.get_attr_scalar(ds, 'DN_to_Radiance_Gain', debug=debug)
-        offset = GK2ADefs.get_attr_scalar(ds, 'DN_to_Radiance_Offset', debug=debug)
+            print(f"--- Entering Calibration for {product_name} ---", file=sys.stderr)
+        try:
+            dn_variable = ds['image_pixel_values']
 
-        if debug:
-            print("[DEBUG] Processed scalar coefficients:", file=sys.stderr)
-            print(f"  - Gain: {gain} (type: {type(gain)})", file=sys.stderr)
-            print(f"  - Offset: {offset} (type: {type(offset)})", file=sys.stderr)
-
-        if gain is None or offset is None:
-            print("Error: Calibration coefficients (Gain/Offset) not found. Cannot calibrate.", file=sys.stderr)
-            return ds # Return original dataset if calibration not possible
-
-        # Convert to Radiance
-        # Radiance = DN * Gain + Offset
-        radiance = dn_variable * gain + offset
-        if debug:
-            print("[DEBUG] Attempting multiplication: radiance = dn_variable * gain + offset", file=sys.stderr)
-            print("[DEBUG] DN to Radiance conversion successful.", file=sys.stderr)
-
-        # Add radiance as a new data variable or replace if it's the primary one
-        if 'radiance' in ds.data_vars:
-            ds['radiance'] = (ds['image_pixel_values'].dims, radiance.data)
-        else:
-            ds = ds.assign(radiance=(ds['image_pixel_values'].dims, radiance.data))
-
-
-        # Handle Brightness Temperature for IR channels
-        if product.startswith('ir'):
-            # Constants for Planck function
-            h = GK2ADefs.get_attr_scalar(ds, 'Plank_constant_h', debug=debug)
-            k = GK2ADefs.get_attr_scalar(ds, 'Boltzmann_constant_k', debug=debug)
-            c = GK2ADefs.get_attr_scalar(ds, 'light_speed', debug=debug)
-            channel_center_wavelength_um = float(GK2ADefs.get_attr_scalar(ds, 'channel_center_wavelength', debug=debug))
-
-            if any(val is None for val in [h, k, c, channel_center_wavelength_um]):
-                print("Error: Planck constants or channel wavelength not found. Cannot calculate Brightness Temperature.", file=sys.stderr)
-                return ds # Return original dataset
-
-            # Wavenumber in m^-1 (convert um to m first)
-            wn = 1e6 / channel_center_wavelength_um # Convert micrometers to m^-1
             if debug:
-                print(f"[DEBUG] Calculated Wavenumber (wn): {wn} (m^-1)", file=sys.stderr)
-
-            # Planck function to get Effective Temperature (Te_eff)
-            # Te_eff = C2 / log(C1/Rad + 1) where C1 = 2hc^2nu^3, C2 = hc.nu/k
-            # Let's use the actual attribute names if they exist
-            C1 = GK2ADefs.get_attr_scalar(ds, 'planck_function_coefficient_c1', debug=debug)
-            C2 = GK2ADefs.get_attr_scalar(ds, 'planck_function_coefficient_c2', debug=debug)
-
-            if C1 is None or C2 is None:
-                if debug:
-                    print("Warning: Planck coefficients C1/C2 not found. Recalculating from fundamental constants.", file=sys.stderr)
-                # Fallback to calculate C1 and C2 if attributes are missing
-                C1 = 2 * h * c**2 * wn**3
-                C2 = h * c * wn / k
+                print(f"[DEBUG] Raw 'image_pixel_values' info:", file=sys.stderr)
+                print(f"  - Type: {type(dn_variable)}", file=sys.stderr)
+                print(f"  - Shape: {dn_variable.shape}", file=sys.stderr)
+                print(f"  - Dtype: {dn_variable.dtype}", file=sys.stderr)
+                if hasattr(dn_variable.data, 'dask'):
+                    print(f"  - Underlying data type (dask array): {type(dn_variable.data)}", file=sys.stderr)
             
-            # Ensure radiance is not zero or negative for log calculation
-            # Use np.maximum to avoid log(0) or log(negative)
-            radiance_for_planck = np.maximum(radiance, 1e-9) # Small positive epsilon
-            if debug:
-                print(f"[DEBUG] Radiance for Planck (radiance_for_planck): {np.nanmin(radiance_for_planck):.3e} to {np.nanmax(radiance_for_planck):.3e}", file=sys.stderr)
-
-            effective_temperature = C2 / np.log(C1 / radiance_for_planck + 1)
-            effective_temperature = xr.DataArray(effective_temperature, dims=dn_variable.dims, coords=dn_variable.coords) # Ensure it's DataArray
-            if debug:
-                print(f"[DEBUG] Effective Temperature (teff): {np.nanmin(effective_temperature.values):.2f} K to {np.nanmax(effective_temperature.values):.2f} K", file=sys.stderr)
-
-            # Apply empirical correction (Teff to Tbb)
-            # Tbb = c0 + c1*Teff + c2*Teff^2 (from GK2A L1B User Manual, page 20)
-            c0 = GK2ADefs.get_attr_scalar(ds, 'Teff_to_Tbb_c0', debug=debug)
-            c1 = GK2ADefs.get_attr_scalar(ds, 'Teff_to_Tbb_c1', debug=debug)
-            c2 = GK2ADefs.get_attr_scalar(ds, 'Teff_to_Tbb_c2', debug=debug)
-
-            if any(val is None for val in [c0, c1, c2]):
+            def get_scalar(attr_name, default=None):
+                """
+                Helper to robustly extract a scalar float from dataset attributes.
+                Handles attributes that might be lists, tuples, or numpy arrays.
+                """
+                val = ds.attrs.get(attr_name, default)
                 if debug:
-                    print("Warning: Teff_to_Tbb coefficients (c0, c1, c2) not found. Skipping Tbb correction.", file=sys.stderr)
-                ds['brightness_temperature'] = effective_temperature # Use effective_temperature as Tbb
-            else:
-                brightness_temperature = c0 + c1 * effective_temperature + c2 * effective_temperature**2
-                brightness_temperature = xr.DataArray(brightness_temperature, dims=dn_variable.dims, coords=dn_variable.coords) # Ensure DataArray
-                ds['brightness_temperature'] = brightness_temperature
+                    print(f"  [get_scalar] Initial value for '{attr_name}': {repr(val)} (type: {type(val)})", file=sys.stderr)
+                
+                # Some files store coefficients in a list/array, extract the first element.
+                while isinstance(val, (list, tuple, np.ndarray, xr.DataArray)):
+                    if len(val) == 0:
+                        raise ValueError(f"Calibration coefficient {attr_name} is an empty sequence.")
+                    val = val[0]
+                    if debug:
+                        print(f"  [get_scalar] Unwrapped to: {repr(val)} (type: {type(val)})", file=sys.stderr)
+                
+                # Ensure the final value is a float.
+                return float(val)
+
+            # Convert Digital Number (DN) to Radiance. This is the first step for all channels.
+            gain = get_scalar('DN_to_Radiance_Gain')
+            offset = get_scalar('DN_to_Radiance_Offset')
+
+            if debug:
+                print("\n[DEBUG] Processed scalar coefficients:", file=sys.stderr)
+                print(f"  - Gain: {gain} (type: {type(gain)})", file=sys.stderr)
+                print(f"  - Offset: {offset} (type: {type(offset)})", file=sys.stderr)
+
+            if gain is None or offset is None:
+                print("Error: Calibration coefficients (Gain/Offset) not found. Cannot calibrate.", file=sys.stderr)
+                return ds # Return original dataset if calibration not possible
+
+            if debug:
+                print("[DEBUG] Attempting multiplication: radiance = dn_variable * gain + offset", file=sys.stderr)
+            radiance = dn_variable * gain + offset
+            radiance.attrs['units'] = 'W m-2 sr-1 um-1' # Note: This is radiance per-micrometer
+            if debug:
+                print("[DEBUG] DN to Radiance conversion successful.", file=sys.stderr)
+                print(f"[DEBUG] Radiance min/max: {radiance.min().compute().item():.3e} to {radiance.max().compute().item():.3e}", file=sys.stderr)
+
+            # --- Channel-Specific Calibration ---
+            channel_type = product_name[:2]  # e.g., 'vi', 'nr', 'sw', 'ir', 'wv'
+
+            if channel_type in ['vi', 'nr']: # Visible and Near-Infrared channels
+                # Convert Radiance to Albedo
+                c = get_scalar('Radiance_to_Albedo_c')
+                fractional_albedo = radiance * c
+                # Clip to physically valid range [0, 1] and scale to percent.
+                albedo = np.clip(fractional_albedo, 0.0, 1.0) * 100
+                albedo.attrs['long_name'] = 'Albedo'
+                albedo.attrs['units'] = '%'
+                ds['albedo'] = albedo
                 if debug:
-                    print(f"[DEBUG] Brightness Temperature (tbb): {np.nanmin(brightness_temperature.values):.2f} K to {np.nanmax(brightness_temperature.values):.2f} K", file=sys.stderr)
+                    print(f"[DEBUG] Albedo: {albedo.min().compute().item():.2f}% to {albedo.max().compute().item():.2f}%", file=sys.stderr)
 
-        elif product.startswith(('vis', 'vnir')): # For visible/VNIR channels (convert to Albedo/Reflectance)
-            # GK2A L1B User Manual (20190618_gk2a_level_1b_data_user_manual_eng.pdf, Page 19)
-            # Albedo = Radiance * Scaling_Factor
-            # Scaling_Factor = pi * D_sun^2 / (Solar_Irradiance * cos(Solar_Zenith_Angle))
-            # Solar_Irradiance is 'channel_solar_irradiance' attribute
-            # D_sun is 'earth_sun_distance_correction_factor' attribute (unit: AU)
-            # Solar_Zenith_Angle: requires solar position, pixel lat/lon, and time. This is more complex.
 
-            # For now, let's just convert radiance to a scaled value if a simple "Radiance_to_Albedo_Scaling_Factor" exists
-            # or use 'albedo_scaling_factor_value' (found in some datasets)
-            albedo_scale = GK2ADefs.get_attr_scalar(ds, 'albedo_scaling_factor_value', debug=debug)
-            if albedo_scale is None:
-                # Fallback to channel_solar_irradiance and earth_sun_distance_correction_factor
-                solar_irradiance = GK2ADefs.get_attr_scalar(ds, 'channel_solar_irradiance', debug=debug)
-                earth_sun_distance = GK2ADefs.get_attr_scalar(ds, 'earth_sun_distance_correction_factor', debug=debug) # in AU
+            elif channel_type in ['sw', 'ir', 'wv']: # Thermal channels
+                # Convert Radiance to Brightness Temperature via inverse Planck function.
+                # The function is only defined for positive radiance.
+                positive_radiance = radiance.where(radiance > 0)
 
-                if solar_irradiance is not None and earth_sun_distance is not None:
-                    # Simplified scaling, actual albedo requires solar zenith angle, which needs geolocation first.
-                    # For a quick fix, if we don't have SZA, we can't do full albedo.
-                    # Let's just return radiance and note the limitation.
-                    if debug:
-                        print("Warning: Full albedo conversion requires Solar Zenith Angle, which needs geolocation. Returning radiance as 'albedo'.", file=sys.stderr)
-                    ds['albedo'] = radiance
-                else:
-                    if debug:
-                        print("Warning: Necessary attributes for Albedo conversion not found. Returning radiance as 'albedo'.", file=sys.stderr)
-                    ds['albedo'] = radiance
-            else:
-                albedo = radiance * albedo_scale
-                ds['albedo'] = xr.DataArray(albedo, dims=dn_variable.dims, coords=dn_variable.coords)
-            
-        if debug:
-            print(f"--- Calibration successful for {product} ---", file=sys.stderr)
-        return ds
+                # Get physical constants from dataset attributes.
+                cval = get_scalar('light_speed')
+                kval = get_scalar('Boltzmann_constant_k')
+                hval = get_scalar('Plank_constant_h')
+
+                # Calculate wavenumber (wn) in m^-1.
+                # The channel_center_wavelength is in micrometers (um).
+                # Convert micrometers to cm^-1 (10000 / um) then to m^-1 ( * 100)
+                wn = (10000.0 / get_scalar('channel_center_wavelength')) * 100.0
+                if debug:
+                    print(f"[DEBUG] Calculated Wavenumber (wn): {wn} (m^-1)", file=sys.stderr)
+
+                # Convert radiance to units required by the Planck function formula.
+                # This 1e-5 scaling factor is critical for GK2A radiance units with SI constants.
+                radiance_for_planck = positive_radiance * 1e-5 
+                if debug:
+                    print(f"[DEBUG] Radiance for Planck (radiance_for_planck): {radiance_for_planck.min().compute().item():.3e} to {radiance_for_planck.max().compute().item():.3e}", file=sys.stderr)
+
+                # Inverse Planck function to get Effective Temperature (Teff)
+                # Term 'e1' corresponds to 2hc^2nu^3
+                e1 = (2.0 * hval * cval * cval) * np.power(wn, 3.0)
+                # Term 'e2' is the adjusted radiance
+                e2 = radiance_for_planck
+                # Guard against division by zero or log of non-positive numbers.
+                e2 = e2.where(e2 > 0) # Ensure no non-positive values for division
+                term_in_log = (e1 / e2) + 1.0
+                term_in_log = term_in_log.where(term_in_log > 0) # Ensure no non-positive values for log
+
+                teff = ((hval * cval / kval) * wn) / np.log(term_in_log)
+                if debug:
+                    print(f"[DEBUG] Effective Temperature (teff): {teff.min().compute().item():.2f} K to {teff.max().compute().item():.2f} K", file=sys.stderr)
+
+
+                # Apply standard polynomial correction to get Brightness Temperature (Tbb)
+                c0 = get_scalar('Teff_to_Tbb_c0')
+                c1_t = get_scalar('Teff_to_Tbb_c1')
+                c2_t = get_scalar('Teff_to_Tbb_c2')
+
+                tbb = c2_t * teff**2 + c1_t * teff + c0
+                tbb.attrs['long_name'] = 'Brightness Temperature'
+                tbb.attrs['units'] = 'K'
+                ds['brightness_temperature'] = tbb
+                if debug:
+                    print(f"[DEBUG] Brightness Temperature (tbb): {tbb.min().compute().item():.2f} K to {tbb.max().compute().item():.2f} K", file=sys.stderr)
+
+            if debug:
+                print(f"--- Calibration successful for {product_name} ---", file=sys.stderr)
+            return ds
+
+        except Exception as e:
+            # If any step fails, log the error and return the original data.
+            print(f"\n---!!! CALIBRATION FAILED for {product_name} !!!---", file=sys.stderr)
+            print(f"ERROR MESSAGE: {e}", file=sys.stderr)
+            if debug:
+                print("\n--- Full Stack Trace ---", file=sys.stderr)
+                traceback.print_exc()
+                print("------------------------", file=sys.stderr)
+            print("Returning uncalibrated data.", file=sys.stderr)
+            return ds
+
 
     def _add_geolocation(self, ds, sensor, debug=False):
         """
@@ -557,10 +584,6 @@ class Gk2aDataFetcher:
                 print("[DEBUG Core Geoloc] Removing existing 'latitude' and 'longitude' coordinates.", file=sys.stderr)
             # Create a new dataset without these coordinates if they exist
             ds = ds.drop_vars(['latitude', 'longitude'], errors='ignore')
-            # If they were actual coordinates (not just variables), this should handle it.
-            # reset_coords can convert coordinate variables to data variables, then drop_vars.
-            # A more robust way might be to create a new dataset from the data variables.
-            # For simplicity, let's assume drop_vars handles it.
 
         if sensor != 'ami':
             if debug:
@@ -569,10 +592,10 @@ class Gk2aDataFetcher:
 
         # Extract necessary parameters from dataset attributes
         # Ensure these attributes exist in the raw dataset
-        image_width = ds.attrs.get('image_width', None)
-        image_height = ds.attrs.get('image_height', None)
+        image_width = GK2ADefs.get_attr_scalar(ds, 'image_width', None, debug=debug)
+        image_height = GK2ADefs.get_attr_scalar(ds, 'image_height', None, debug=debug)
         # Convert channel_spatial_resolution to float if it's a string
-        resolution_km = float(ds.attrs.get('channel_spatial_resolution', 2.0)) # Default to 2.0km if not found
+        resolution_km = float(GK2ADefs.get_attr_scalar(ds, 'channel_spatial_resolution', 2.0, debug=debug)) # Default to 2.0km if not found
 
         # Ensure these core attributes are available
         if image_width is None or image_height is None:
@@ -585,7 +608,8 @@ class Gk2aDataFetcher:
 
         # Convert sub_satellite_lon_deg from radians to degrees if it's stored as radians in ds.attrs
         # The image_center_longitude in GK2A datasets is often in radians.
-        if ds.attrs.get('image_center_longitude_units') == 'radians':
+        # Check if attribute exists before accessing it
+        if 'image_center_longitude_units' in ds.attrs and ds.attrs['image_center_longitude_units'] == 'radians':
              sub_satellite_lon_deg = np.rad2deg(sub_satellite_lon_deg)
              if debug:
                  print(f"[DEBUG Core Geoloc] Converted image_center_longitude from radians to degrees: {sub_satellite_lon_deg:.4f}", file=sys.stderr)
@@ -627,14 +651,15 @@ class Gk2aDataFetcher:
             # Assign coordinates. xarray handles broadcasting if lat_coords/lon_coords are 2D.
             # Make sure the time dimension is preserved if the dataset originally had it.
             # The lat/lon coords are computed for the 2D image, so we add them at the image dimension level.
+            # Corrected: Both latitude and longitude should typically use the same (y_dim_name, x_dim_name) order
             ds = ds.assign_coords(latitude=((y_dim_name, x_dim_name), lat_coords))
-            ds = ds.assign_coords(longitude=((x_dim_name, y_dim_name), lon_coords)) # Longitude should typically be (x_dim, y_dim) or (y_dim, x_dim) consistent with latitude
+            ds = ds.assign_coords(longitude=((y_dim_name, x_dim_name), lon_coords))
 
 
             if debug:
-                print("[DEBUG Core Geoloc] Successfully added GEOS-based geolocation coordinates.")
-                print(f"  Final Latitudes Array Info:\n  Shape: {lat_coords.shape}\n  Min: {np.nanmin(lat_coords):.4f} deg\n  Max: {np.nanmax(lat_coords):.4f} deg\n  NaN Count: {np.isnan(lat_coords).sum().item()} / {lat_coords.size} ({np.isnan(lat_coords).sum().item()/lat_coords.size*100:.2f}%)")
-                print(f"  Final Longitudes Array Info:\n  Shape: {lon_coords.shape}\n  Min: {np.nanmin(lon_coords):.4f} deg\n  Max: {np.nanmax(lon_coords):.4f} deg\n  NaN Count: {np.isnan(lon_coords).sum().item()} / {lon_coords.size} ({np.isnan(lon_coords).sum().item()/lon_coords.size*100:.2f}%)")
+                print("[DEBUG Core Geoloc] Successfully added GEOS-based geolocation coordinates.", file=sys.stderr)
+                print(f"  Final Latitudes Array Info:\n  Shape: {lat_coords.shape}\n  Min: {np.nanmin(lat_coords):.4f} deg\n  Max: {np.nanmax(lat_coords):.4f} deg\n  NaN Count: {np.isnan(lat_coords).sum().item()} / {lat_coords.size} ({np.isnan(lat_coords).sum().item()/lat_coords.size*100:.2f}%)", file=sys.stderr)
+                print(f"  Final Longitudes Array Info:\n  Shape: {lon_coords.shape}\n  Min: {np.nanmin(lon_coords):.4f} deg\n  Max: {np.nanmax(lon_coords):.4f} deg\n  NaN Count: {np.isnan(lon_coords).sum().item()} / {lon_coords.size} ({np.isnan(lon_coords).sum().item()/lon_coords.size*100:.2f}%)", file=sys.stderr)
 
         except Exception as e:
             print(f"Error computing geolocation with GEOS-based method: {e}", file=sys.stderr)
@@ -648,6 +673,9 @@ class Gk2aDataFetcher:
         """
         Fetches GK2A satellite data.
         """
+        ds = None # Initialize ds to None for scope
+        file_info = None # Initialize file_info
+
         if query_type == 'latest':
             # For 'latest', search a recent time window (e.g., last 24 hours)
             # to find the most recent file.
@@ -662,12 +690,7 @@ class Gk2aDataFetcher:
             # Get the very latest file
             file_info = found_files[-1]
             ds = self._load_as_xarray(f"s3://{self.s3_bucket}/{file_info['s3_key']}", debug=debug)
-            if ds and calibrate:
-                ds = self._calibrate(ds, product, debug=debug)
-            # Add time dimension if not present (for consistency)
-            if 'time' not in ds.dims:
-                ds = ds.expand_dims(time=[file_info['datetime']])
-
+            
         elif query_type == 'nearest':
             if not target_time: raise ValueError("`target_time` is required for 'nearest' query.")
             
@@ -685,20 +708,15 @@ class Gk2aDataFetcher:
             if debug:
                 print(f"Nearest file found: {file_info['s3_key']}", file=sys.stderr)
             ds = self._load_as_xarray(f"s3://{self.s3_bucket}/{file_info['s3_key']}", debug=debug)
-            if ds and calibrate:
-                ds = self._calibrate(ds, product, debug=debug)
-            # Add time dimension if not present (for consistency)
-            if 'time' not in ds.dims:
-                ds = ds.expand_dims(time=[file_info['datetime']])
-
+            
         elif query_type == 'range':
             if not start_time or not end_time: raise ValueError("`start_time` and `end_time` are required for 'range' query.")
             found_files = self._find_files(sensor, product, start_time, end_time, area, debug=debug)
             if not found_files: return None
 
             datasets = []
-            for file_info in found_files:
-                ds_single = self._load_as_xarray(f"s3://{self.s3_bucket}/{file_info['s3_key']}", debug=debug)
+            for file_info_single in found_files: # Renamed to avoid conflict with outer file_info
+                ds_single = self._load_as_xarray(f"s3://{self.s3_bucket}/{file_info_single['s3_key']}", debug=debug)
                 if ds_single:
                     if calibrate:
                         ds_single = self._calibrate(ds_single, product, debug=debug)
@@ -716,7 +734,7 @@ class Gk2aDataFetcher:
 
                     ds_clean = ds_single[[main_var]]
                     # Add time dimension before appending for concatenation.
-                    datasets.append(ds_clean.expand_dims(time=[file_info['datetime']]))
+                    datasets.append(ds_clean.expand_dims(time=[file_info_single['datetime']]))
             
             if not datasets: return None
             # Combine all individual datasets into a single timeseries dataset.
@@ -725,11 +743,19 @@ class Gk2aDataFetcher:
         else:
             raise ValueError(f"Unknown query_type: '{query_type}'. Must be 'latest', 'nearest', or 'range'.")
 
-        # Apply geolocation if enabled and data was successfully fetched
-        if ds is not None and geolocation_enabled:
-            if debug:
-                print(f"\n--- Adding Geolocation for {product.upper()} Data ---", file=sys.stderr)
-            ds = self._add_geolocation(ds, sensor, debug=debug)
+        # Common post-loading steps
+        if ds is not None:
+            if calibrate and query_type != 'range': # Only calibrate once if not a range query (already done per-file in range)
+                ds = self._calibrate(ds, product, debug=debug)
+            
+            # Add time dimension if not present (for consistency in 'latest' and 'nearest' after calibration)
+            if query_type in ['latest', 'nearest'] and 'time' not in ds.dims and file_info:
+                ds = ds.expand_dims(time=[file_info['datetime']])
+
+            # Apply geolocation if enabled and data was successfully fetched
+            if geolocation_enabled:
+                if debug:
+                    print(f"\n--- Adding Geolocation for {product.upper()} Data ---", file=sys.stderr)
+                ds = self._add_geolocation(ds, sensor, debug=debug)
             
         return ds
-
