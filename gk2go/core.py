@@ -680,7 +680,7 @@ class Gk2aDataFetcher:
 
 
     def get_data(self, sensor, product, area, query_type, target_time=None,
-                 start_time=None, end_time=None, calibrate=False, geolocation_enabled=True, debug=False):
+                 start_time=None, end_time=None, calibrate=True, geolocation_enabled=False, debug=False):
         """
         Fetches GK2A satellite data.
         """
