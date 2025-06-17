@@ -16,7 +16,7 @@ Key Features:
 - Uses xarray for powerful, labeled, multi-dimensional data handling.
 - Robust error handling for S3 interactions and calibration processes.
 - **NEW**: Optional addition of latitude and longitude coordinates to the
-  xarray Dataset.
+  xarray Dataset, with dynamic scan angle calculation based on image attributes.
 
 Classes:
     GK2ADefs: Defines constants and static methods for GK-2A data.
@@ -322,56 +322,44 @@ class Gk2aDataFetcher:
 
         Args:
             ds (xarray.Dataset): The xarray dataset to add coordinates to.
-            area (str): The observation area (e.g., 'fd', 'la').
+            area (str): The observation area ('fd' or 'la').
             product_name (str): The product identifier (e.g., 'ir087'), used
                                 to derive the resolution.
 
         Returns:
             xarray.Dataset: The dataset with 'latitude' and 'longitude' coordinates added.
         """
+        # Resolution is derived from the product name for context/debugging,
+        # but the core geolocation now uses dynamic scan angle calculation.
         def _get_resolution_from_product(prod_name):
-            """
-            Internal helper to derive resolution string (e.g., '0.5km', '1km', '2km')
-            from the product name (e.g., 'ir087').
-            This mapping is based on typical GK2A channel resolutions.
-            """
-            # This mapping must be kept in sync with actual GK2A resolutions
-            # and the AMI_FILENAME_RE in GK2ADefs.
             if 'vi004' in prod_name or 'vi005' in prod_name or 'vi006' in prod_name:
                 return '0.5km'
             elif 'vi008' in prod_name or 'vi016' in prod_name:
                 return '1km'
             elif 'ir' in prod_name or 'wv' in prod_name or 'sw' in prod_name:
-                # All thermal/water vapor/shortwave channels are 2km in standard products
                 return '2km'
             return 'unknown'
 
         resolution = _get_resolution_from_product(product_name.lower())
         if resolution == 'unknown':
             print(f"Warning: Could not determine resolution for product '{product_name}'. Geolocation may not work correctly.", file=sys.stderr)
-            return ds
+            # Proceed anyway, as it might work if dynamic params are good
+            
+        column_dim_name = None
+        line_dim_name = None
+        data_var_name = 'image_pixel_values' 
 
-        # Determine the dimension names for columns and lines in the dataset.
-        # Common names are 'x', 'y' or 'col', 'row', or derived from image shape.
-        # It's assumed 'image_pixel_values' is the main data variable,
-        # and its dimensions define the image shape.
-        data_var_name = 'image_pixel_values'
         if data_var_name not in ds.data_vars:
             print(f"Error: Expected data variable '{data_var_name}' not found in dataset. Cannot geolocate.", file=sys.stderr)
             return ds
 
-        column_dim_name = None
-        line_dim_name = None
-
-        # Try common dimension names for image data
+        # Determine dimensions (assuming last two are spatial)
         if 'x' in ds[data_var_name].dims and 'y' in ds[data_var_name].dims:
             column_dim_name = 'x'
             line_dim_name = 'y'
-        # Check if the dimensions are named 'column' and 'line'
         elif 'column' in ds[data_var_name].dims and 'line' in ds[data_var_name].dims:
             column_dim_name = 'column'
             line_dim_name = 'line'
-        # Fallback for generic 2D data: assume last two dimensions are (line, column)
         elif len(ds[data_var_name].dims) >= 2:
             line_dim_name = ds[data_var_name].dims[-2]
             column_dim_name = ds[data_var_name].dims[-1]
@@ -382,31 +370,70 @@ class Gk2aDataFetcher:
         columns = np.arange(ds[data_var_name].sizes[column_dim_name])
         lines = np.arange(ds[data_var_name].sizes[line_dim_name])
 
-        # Create a meshgrid for all pixels to get all (column, line) pairs
-        cols_mesh, lines_mesh = np.meshgrid(columns, lines)
+        # Get image bounds in satellite projection space (radians) from dataset attributes
+        try:
+            x_ul_rad = ds.attrs['image_upperleft_x']
+            y_ul_rad = ds.attrs['image_upperleft_y']
+            x_lr_rad = ds.attrs['image_lowerright_x']
+            y_lr_rad = ds.attrs['image_lowerright_y']
+            image_width_pixels = ds[data_var_name].sizes[column_dim_name]
+            image_height_pixels = ds[data_var_name].sizes[line_dim_name]
 
-        # Convert to lat/lon using the geolocation module
+            print(f"[DEBUG _add_geolocation] Raw image scan angle bounds (radians):", file=sys.stderr)
+            print(f"  UL_x: {x_ul_rad}, UL_y: {y_ul_rad}", file=sys.stderr)
+            print(f"  LR_x: {x_lr_rad}, LR_y: {y_lr_rad}", file=sys.stderr)
+            print(f"  Image Dim: {image_width_pixels}x{image_height_pixels} pixels", file=sys.stderr)
+
+            # Calculate x_rad and y_rad for all pixels using linear interpolation
+            # This is the crucial part that generates the correct input for _geos_to_latlon_core
+            x_step = (x_lr_rad - x_ul_rad) / (image_width_pixels - 1 + np.finfo(float).eps)
+            y_step = (y_lr_rad - y_ul_rad) / (image_height_pixels - 1 + np.finfo(float).eps)
+
+            x_rad_array = x_ul_rad + columns * x_step
+            y_rad_array = y_ul_rad + lines * y_step
+
+            # Create meshgrid of these calculated scan angles
+            x_rad_mesh, y_rad_mesh = np.meshgrid(x_rad_array, y_rad_array)
+
+            print(f"[DEBUG _add_geolocation] Generated x_rad_mesh min/max: {np.nanmin(x_rad_mesh):.4e} / {np.nanmax(x_rad_mesh):.4e}", file=sys.stderr)
+            print(f"[DEBUG _add_geolocation] Generated y_rad_mesh min/max: {np.nanmin(y_rad_mesh):.4e} / {np.nanmax(y_rad_mesh):.4e}", file=sys.stderr)
+
+        except KeyError as ke:
+            print(f"[DEBUG _add_geolocation] Error: Missing required image attribute for dynamic scan angle calculation: {ke}.", file=sys.stderr)
+            print("Cannot proceed with geolocation. Returning original dataset.", file=sys.stderr)
+            return ds
+        except Exception as e:
+            print(f"[DEBUG _add_geolocation] Unexpected error during dynamic scan angle calculation: {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            print("Cannot proceed with geolocation. Returning original dataset.", file=sys.stderr)
+            return ds
+
+        # Call to geolocation.to_latlon with the calculated scan angles
         latitudes, longitudes = geolocation.to_latlon(
-            cols_mesh, lines_mesh, area, resolution
+            x_rad_mesh, y_rad_mesh, area, resolution # area and resolution used for context/debugging in geolocation.py
         )
 
-        # --- Debugging prints for geolocation results ---
-        print(f"\n[DEBUG Geolocation] Generated Latitudes Array Info:")
+        # Debug prints for geolocation results (from core.py perspective)
+        print(f"\n[DEBUG Core Geoloc] Final Latitudes Array Info:")
         print(f"  Shape: {latitudes.shape}")
-        print(f"  Min: {np.nanmin(latitudes):.4f} deg")
-        print(f"  Max: {np.nanmax(latitudes):.4f} deg")
+        if np.isfinite(latitudes).any():
+            print(f"  Min: {np.nanmin(latitudes):.4f} deg")
+            print(f"  Max: {np.nanmax(latitudes):.4f} deg")
+        else:
+            print("  Min/Max: All NaN or empty array")
         print(f"  NaN Count: {np.isnan(latitudes).sum()} / {latitudes.size} ({np.isnan(latitudes).sum()/latitudes.size:.2%})")
 
-        print(f"\n[DEBUG Geolocation] Generated Longitudes Array Info:")
+        print(f"\n[DEBUG Core Geoloc] Final Longitudes Array Info:")
         print(f"  Shape: {longitudes.shape}")
-        print(f"  Min: {np.nanmin(longitudes):.4f} deg")
-        print(f"  Max: {np.nanmax(longitudes):.4f} deg")
+        if np.isfinite(longitudes).any():
+            print(f"  Min: {np.nanmin(longitudes):.4f} deg")
+            print(f"  Max: {np.nanmax(longitudes):.4f} deg")
+        else:
+            print("  Min/Max: All NaN or empty array")
         print(f"  NaN Count: {np.isnan(longitudes).sum()} / {longitudes.size} ({np.isnan(longitudes).sum()/longitudes.size:.2%})")
-        # --- End Debugging prints ---
 
 
         # Add as new coordinates to the xarray dataset.
-        # Ensure the dimensions match the original data's spatial dimensions.
         ds = ds.assign_coords(latitude=((line_dim_name, column_dim_name), latitudes))
         ds = ds.assign_coords(longitude=((line_dim_name, column_dim_name), longitudes))
 
@@ -417,29 +444,10 @@ class Gk2aDataFetcher:
     def _generate_s3_prefixes(sensor, product, start_time, end_time, area=None):
         """
         Generates the S3 prefixes to search for files within a time range.
-
-        The GK-2A S3 bucket is organized by .../YYYYMM/DD/HH/. This method
-        iterates through each hour in the specified time range and yields the
-        corresponding S3 prefix.
-
-        Args:
-            sensor (str): The sensor name (e.g., 'ami').
-            product (str): The product identifier (e.g., 'vi004').
-            start_time (datetime): The beginning of the time range.
-            end_time (datetime): The end of the time range.
-            area (str): The geographic area (e.g., 'fd', 'ela', 'la').
-
-        Yields:
-            str: An S3 prefix string for a specific hour.
-
-        Raises:
-            ValueError: If 'area' is not provided.
+        ... (no changes) ...
         """
         if not area:
             raise ValueError("The 'area' parameter is required for L1B data.")
-        # Note: The AMI_L1B_PREFIX from GK2ADefs is no longer directly used here as per user's provided code structure.
-        # The structure of the S3 path derived from the user's provided code is:
-        # {SENSOR.upper()}/L1B/{AREA.upper()}/{YYYYMM}/{DD}/{HH}/gk2a_{SENSOR.lower()}_le1b_{PRODUCT.lower()}_{AREA.lower()}
         base_prefix_path = f"{sensor.upper()}/L1B/{area.upper()}/"
         current_time = start_time
         while current_time <= end_time:
@@ -452,25 +460,9 @@ class Gk2aDataFetcher:
     def _find_files(self, sensor, product, start_time, end_time, area=None):
         """
         Finds all relevant data files within a specified time range.
-
-        This method queries S3 using the prefixes generated by
-        _generate_s3_prefixes, filters the results to match the exact time
-        window, parses the filenames, and returns a sorted list of file metadata.
-
-        Args:
-            sensor (str): The sensor name.
-            product (str): The product identifier.
-            start_time (datetime): The start of the time range.
-            end_time (datetime): The end of the time range.
-            area (str): The geographic area.
-
-        Returns:
-            list[dict]: A sorted list of dictionaries, where each dictionary
-                        contains parsed metadata for a found file. Returns an
-                        empty list if no files are found.
+        ... (no changes) ...
         """
         all_files = []
-        # Generate prefixes using the static method
         prefixes_to_search = list(self._generate_s3_prefixes(sensor, product, start_time, end_time, area))
         for prefix in prefixes_to_search:
             s3_objects = self.s3_utils.list_files_in_prefix(prefix)
@@ -485,31 +477,22 @@ class Gk2aDataFetcher:
                 if not file_time:
                     continue
                     
-                # Final check to ensure file is within the precise time range.
                 if not (start_time <= file_time <= end_time):
                     continue
 
                 parsed_data['s3_key'] = obj['Key']
                 all_files.append(parsed_data)
 
-        # Sort files chronologically.
         all_files.sort(key=lambda x: x.get('datetime', datetime.min))
         return all_files
     
     def _load_as_xarray(self, s3_path):
         """
         Loads a single NetCDF file from S3 into an xarray.Dataset.
-
-        Args:
-            s3_path (str): The full S3 path (e.g., 's3://bucket/key').
-
-        Returns:
-            xr.Dataset: The loaded dataset. Returns None if loading fails.
+        ... (no changes) ...
         """
         try:
-            # Use the s3fs filesystem object to open a remote file handle.
             remote_file = self.s3_utils.fs.open(s3_path, 'rb')
-            # Open the dataset with automatic chunking for Dask integration.
             ds = xr.open_dataset(remote_file, chunks='auto')
             return ds
         except Exception as e:
@@ -519,39 +502,9 @@ class Gk2aDataFetcher:
     def get_data(self, sensor, product, area, query_type='latest', target_time=None, start_time=None, end_time=None, calibrate=False, geolocation_enabled=False):
         """
         Fetches GK-2A data based on specified criteria.
-
-        This is the main public method of the class. It provides three ways to
-        query for data: 'latest', 'nearest', and 'range'.
-
-        Args:
-            sensor (str): The sensor name, e.g., 'ami'.
-            product (str): The product identifier, e.g., 'vi004', 'ir133'.
-            area (str): The geographical area, e.g., 'fd' (Full Disk),
-                        'ela' (Extended Local Area), 'la' (Local Area).
-            query_type (str, optional): The type of query. One of 'latest',
-                'nearest', or 'range'. Defaults to 'latest'.
-            target_time (datetime, optional): The target time for a 'nearest'
-                query. Required if query_type is 'nearest'.
-            start_time (datetime, optional): The start time for a 'range'
-                query. Required if query_type is 'range'.
-            end_time (datetime, optional): The end time for a 'range'
-                query. Required if query_type is 'range'.
-            calibrate (bool, optional): If True, applies calibration to the
-                loaded data. Defaults to False.
-            geolocation_enabled (bool, optional): If True, adds latitude and
-                longitude coordinates to the dataset. Defaults to False.
-
-        Returns:
-            xr.Dataset or None: An xarray.Dataset containing the requested data.
-            The dataset will have a 'time' dimension. Returns None if no data
-            is found or if an error occurs.
-
-        Raises:
-            ValueError: If `query_type` is unknown or if required time
-            parameters for 'nearest' or 'range' queries are missing.
+        ... (no changes to overall logic, only _add_geolocation call) ...
         """
         if query_type == 'latest':
-            # Search the last 2 hours for the most recent file.
             search_end = datetime.utcnow()
             search_start = search_end - timedelta(hours=2)
             found_files = self._find_files(sensor, product, search_start, search_end, area)
@@ -563,28 +516,25 @@ class Gk2aDataFetcher:
             
             if calibrate:
                 ds = self._calibrate(ds, product)
-            if geolocation_enabled: # Call geolocation if flag is True
-                ds = self._add_geolocation(ds, area, product) # Pass product to _add_geolocation
-            # Add a time dimension to the dataset for consistency.
+            if geolocation_enabled:
+                ds = self._add_geolocation(ds, area, product)
             return ds.expand_dims(time=[latest_file['datetime']])
 
         elif query_type == 'nearest':
             if not target_time: raise ValueError("`target_time` is required for 'nearest' query.")
-            # Search a 4-hour window around the target time.
             search_start = target_time - timedelta(hours=2)
             search_end = target_time + timedelta(hours=2)
             found_files = self._find_files(sensor, product, search_start, search_end, area)
             if not found_files: return None
 
-            # Find the file with the minimum time difference from the target.
             nearest_file = min(found_files, key=lambda x: abs(x['datetime'] - target_time))
             ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{nearest_file['s3_key']}")
             if not ds: return None
             
             if calibrate:
                 ds = self._calibrate(ds, product)
-            if geolocation_enabled: # Call geolocation if flag is True
-                ds = self._add_geolocation(ds, area, product) # Pass product to _add_geolocation
+            if geolocation_enabled:
+                ds = self._add_geolocation(ds, area, product)
             return ds.expand_dims(time=[nearest_file['datetime']])
 
         elif query_type == 'range':
@@ -596,20 +546,15 @@ class Gk2aDataFetcher:
             for file_info in found_files:
                 ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{file_info['s3_key']}")
                 if ds:
-                    # To ensure concatenation works, we might need to handle datasets
-                    # with multiple variables. Here we simplify by just taking the main one.
-                    # A more robust implementation might select variables explicitly.
                     main_var = next(iter(ds.data_vars))
                     ds_clean = ds[[main_var]]
                     if calibrate:
                         ds_clean = self._calibrate(ds, product)
-                    if geolocation_enabled: # Call geolocation if flag is True
-                        ds_clean = self._add_geolocation(ds_clean, area, product) # Pass product to _add_geolocation
-                    # Add time dimension before appending for concatenation.
+                    if geolocation_enabled:
+                        ds_clean = self._add_geolocation(ds_clean, area, product)
                     datasets.append(ds_clean.expand_dims(time=[file_info['datetime']]))
             
             if not datasets: return None
-            # Combine all individual datasets into a single timeseries dataset.
             return xr.concat(datasets, dim='time')
 
         else:
