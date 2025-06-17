@@ -203,7 +203,7 @@ class GK2ADefs:
     GK2A_FILENAME_PATTERN = re.compile(
         r'gk2a_(?P<sensor>ami|ksem)_le1b_(?P<product>[a-z0-9]+)_'
         r'(?P<area>[a-z]+)(?P<res>\d{3})ge_'
-        r'(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})_'
+        r'(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})'
         r'(?P<hour>\d{2})(?P<minute>\d{2})\.nc$'
     )
 
