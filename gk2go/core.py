@@ -397,14 +397,21 @@ class Gk2aDataFetcher:
         try:
             if debug:
                 print(f"Loading data from: {s3_path}", file=sys.stderr)
+              
+            # Use the s3fs filesystem object to open a remote file handle.
+            remote_file = self.s3_utils.fs.open(s3_path, 'rb')
+            # Open the dataset with automatic chunking for Dask integration.
+            ds = xr.open_dataset(remote_file, chunks='auto')
+            return ds
+          
             # Use s3fs to open the file directly via xarray
             # Use engine='h5netcdf' as these are NetCDF4 files, and 'scipy' often struggles.
-            with self.s3_utils.s3_fs.open(s3_path, mode='rb') as f:
-                # Use 'h5netcdf' engine for NetCDF4 files, and allow lazy loading with 'chunks=auto'
-                ds = xr.open_dataset(f, engine='h5netcdf', decode_coords="all", chunks='auto')
-                # CRITICAL FIX: Force data to be loaded into memory before 'f' is closed
-                ds.load() 
-            return ds
+            #with self.s3_utils.s3_fs.open(s3_path, mode='rb') as f:
+            #    # Use 'h5netcdf' engine for NetCDF4 files, and allow lazy loading with 'chunks=auto'
+            #    ds = xr.open_dataset(f, engine='h5netcdf', decode_coords="all", chunks='auto')
+            #    # CRITICAL FIX: Force data to be loaded into memory before 'f' is closed
+            #    ds.load() 
+            #return ds
         except Exception as e:
             print(f"Error loading xarray dataset from {s3_path}: {e}", file=sys.stderr)
             if debug:
@@ -579,11 +586,11 @@ class Gk2aDataFetcher:
         """
         # It's crucial to remove existing lat/lon coords that might be loaded
         # from the NetCDF, as they are often incorrect or too limited for full disk.
-        if 'latitude' in ds.coords and 'longitude' in ds.coords:
-            if debug:
-                print("[DEBUG Core Geoloc] Removing existing 'latitude' and 'longitude' coordinates.", file=sys.stderr)
-            # Create a new dataset without these coordinates if they exist
-            ds = ds.drop_vars(['latitude', 'longitude'], errors='ignore')
+        #if 'latitude' in ds.coords and 'longitude' in ds.coords:
+        #    if debug:
+        #        print("[DEBUG Core Geoloc] Removing existing 'latitude' and 'longitude' coordinates.", file=sys.stderr)
+        #    # Create a new dataset without these coordinates if they exist
+        #    ds = ds.drop_vars(['latitude', 'longitude'], errors='ignore')
 
         if sensor != 'ami':
             if debug:
