@@ -12,14 +12,17 @@ temperature.
 Key Features:
 - Fetch the latest available data, data nearest to a specific time, or data
   within a given time range.
-- On-the-fly calibration of raw data to physical units.
+- On-the-fly calibration: *requires external calibration coefficients to be provided
+  as attributes within the xarray.Dataset itself*.
 - Uses xarray for powerful, labeled, multi-dimensional data handling.
 - Robust error handling for S3 interactions and calibration processes.
+- **NEW**: Optional addition of latitude and longitude coordinates to the
+  xarray Dataset using detailed projection models for 'FD' and 'LA' areas.
 
 Classes:
-    GK2ADefs: Defines constants and static methods for GK-2A data.
+    GK2ADefs: Defines constants and static methods for GK2A data.
     S3Utils: Provides utility functions for interacting with the S3 bucket.
-    Gk2aDataFetcher: The main class for finding and loading GK-2A data.
+    Gk2aDataFetcher: The main class for finding and loading GK2A data.
 """
 
 import os
@@ -38,127 +41,194 @@ from botocore import UNSIGNED
 from dateutil.parser import parse as parse_date
 import numpy as np
 
+# Import the new geolocation module
+# Assumes geolocation.py is in the same directory or accessible via Python path
+try:
+    from . import geolocation
+except ImportError:
+    # Fallback for direct script execution or if not part of a package
+    import geolocation
+
 
 class GK2ADefs:
     """
-    A container for constants and static definitions related to GK-2A AMI data.
-
-    This class centralizes key information such as S3 bucket details, AWS region,
-    and filename parsing logic to ensure consistency across the module.
+    Defines constants and static methods related to GK2A satellite data.
     """
-    # Regex to parse the standard GK-2A AMI LE1B filename format.
-    # It captures key metadata components like satellite, sensor, product, area,
-    # resolution, and timestamp.
-    AMI_FILENAME_RE = re.compile(
-        r"^(?P<satellite>gk2a)_"
-        r"(?P<sensor>ami)_"
-        r"(?P<level>le1b)_"
-        r"(?P<product>[a-z]{2}\d{3})_"
-        r"(?P<area>fd|ela|la)"
-        r"(?P<resolution>\d{3})"
-        r"(?P<projection>ge)_"
-        r"(?P<timestamp>\d{12})\."
-        r"(?P<format>nc|png)$"
-    )
-    # The public S3 bucket hosting the NOAA GK-2A PDS.
-    S3_BUCKET = "noaa-gk2a-pds"
-    # The AWS region where the S3 bucket is located.
-    AWS_REGION = "us-east-1"
+    S3_BUCKET = "noaa-ghe-pds" # S3 bucket name
+    AMI_L1B_PREFIX = "GKO/AMI/L1B" # Prefix for AMI Level 1B data
+
+    # AMI Channels and their resolutions. This is a simplified mapping;
+    # actual resolution can depend on area.
+    # Ref: 20190618_gk2a_level_1b_data_user_manual_eng.pdf (Page 5)
+    AMI_CHANNELS_RESOLUTION = {
+        'vi004': '0.5km', 'vi005': '0.5km', 'vi006': '0.5km', 'vi008': '1km',
+        'vi016': '1km', 'ir039': '2km', 'wv062': '2km', 'wv069': '2km',
+        'wv073': '2km', 'ir087': '2km', 'ir096': '2km', 'ir105': '2km',
+        'ir112': '2km', 'ir123': '2km', 'ir133': '2km', 'sw037': '2km'
+    }
+  
+    @staticmethod
+    def get_product_prefix(sensor, product, area):
+        """Constructs the S3 object key prefix for a given sensor, product, and area."""
+        # Example: GKO/AMI/L1B/FD/2019/07/20/AMI_L1B_FD020_20190720_000000.nc
+        return f"{GK2ADefs.AMI_L1B_PREFIX}/{area.upper()}"
 
     @staticmethod
-    def parse_filename(filename):
-        """
-        Parses a GK-2A AMI filename to extract metadata.
-
-        Args:
-            filename (str): The filename to parse.
-
-        Returns:
-            dict: A dictionary containing the parsed components of the filename,
-                  including a 'datetime' object. Returns None if the filename
-                  does not match the expected format.
-        """
-        ami_match = GK2ADefs.AMI_FILENAME_RE.match(filename)
-        if ami_match:
-            data = ami_match.groupdict()
-            try:
-                # Convert the timestamp string into a Python datetime object.
-                data['datetime'] = datetime.strptime(data['timestamp'], '%Y%m%d%H%M')
-            except ValueError:
-                # Handle cases where the timestamp is not a valid date.
-                data['datetime'] = None
-            return data
-        return None
-
+    def get_resolution(product_name):
+        """Returns the resolution string for a given product."""
+        return GK2ADefs.AMI_CHANNELS_RESOLUTION.get(product_name.lower(), 'unknown')
+      
 
 class S3Utils:
     """
-    A utility class for handling interactions with Amazon S3.
-
-    This class abstracts the setup of boto3 and s3fs clients for anonymous
-    access to public S3 buckets. It provides a simplified interface for
-    listing objects within a specified prefix.
+    Utility functions for interacting with the AWS S3 bucket.
     """
     def __init__(self):
-        """
-        Initializes the S3 clients for anonymous access.
+        # Configure botocore to use anonymous access for public S3 buckets
+        self.config = Config(signature_version=UNSIGNED)
+        self.s3_client = boto3.client("s3", config=self.config)
+        self.s3_filesystem = s3fs.S3FileSystem(anon=True)
 
-        Raises:
-            Exception: If there is an error during client initialization.
+    def list_files(self, prefix):
         """
-        try:
-            # s3fs is used by xarray for opening S3 objects directly.
-            self.fs = s3fs.S3FileSystem(anon=True)
-            # boto3 is used for more granular S3 operations like listing.
-            self.s3_client = boto3.client(
-                's3',
-                region_name=GK2ADefs.AWS_REGION,
-                config=Config(signature_version=UNSIGNED)
-            )
-        except Exception as e:
-            print(f"FATAL: Error initializing S3 clients: {e}", file=sys.stderr)
-            raise
-
-    def list_files_in_prefix(self, prefix):
-        """
-        Lists all files in a given S3 bucket and prefix.
-
-        This method uses a paginator to efficiently handle prefixes that may
-        contain a large number of objects.
+        Lists all objects within a given S3 prefix.
 
         Args:
-            prefix (str): The S3 prefix (folder path) to search within.
+            prefix (str): The S3 prefix to list objects from.
 
-        Yields:
-            dict: A dictionary representing an S3 object, as returned by
-                  the boto3 list_objects_v2 operation.
+        Returns:
+            list: A list of S3 object keys (full paths).
         """
-        paginator = self.s3_client.get_paginator('list_objects_v2')
         try:
-            # Paginate through results to handle large directories.
-            for page in paginator.paginate(Bucket=GK2ADefs.S3_BUCKET, Prefix=prefix):
+            paginator = self.s3_client.get_paginator("list_objects_v2")
+            pages = paginator.paginate(Bucket=GK2ADefs.S3_BUCKET, Prefix=prefix)
+            keys = []
+            for page in pages:
                 if "Contents" in page:
                     for obj in page["Contents"]:
-                        yield obj
+                        keys.append(obj["Key"])
+            return keys
         except ClientError as e:
-            # Suppress 'NoSuchKey' errors, as it's valid for a prefix to not exist.
-            # Log other client errors.
-            if e.response['Error']['Code'] != 'NoSuchKey':
-                print(f"ERROR: S3 client error on prefix '{prefix}': {e}", file=sys.stderr)
-            return
+            print(f"Error listing S3 files for prefix {prefix}: {e}")
+            return []
+
+    def get_latest_file(self, prefix):
+        """
+        Retrieves the latest (most recently modified) file from an S3 prefix.
+
+        Args:
+            prefix (str): The S3 prefix to search.
+
+        Returns:
+            dict or None: A dictionary containing 's3_key' and 'last_modified'
+                          datetime object, or None if no files are found.
+        """
+        try:
+            response = self.s3_client.list_objects_v2(
+                Bucket=GK2ADefs.S3_BUCKET,
+                Prefix=prefix,
+                MaxKeys=1000 # Fetch a reasonable number to find the latest
+            )
+            if "Contents" in response:
+                # Sort by LastModified timestamp in descending order
+                latest_object = max(response["Contents"], key=lambda obj: obj["LastModified"])
+                return {
+                    "s3_key": latest_object["Key"],
+                    "last_modified": latest_object["LastModified"],
+                }
+            return None
+        except ClientError as e:
+            print(f"Error getting latest S3 file for prefix {prefix}: {e}")
+            return None
 
 
 class Gk2aDataFetcher:
     """
-    A class to fetch and process GK-2A satellite data from Amazon S3.
-
-    This is the main entry point for users to acquire data. It orchestrates
-    the process of finding the correct files based on user criteria, loading
-    them into xarray Datasets, and optionally applying calibration.
+    Main class for discovering and loading GK2A satellite data.
     """
     def __init__(self):
-        """Initializes the Gk2aDataFetcher with an S3 utility instance."""
         self.s3_utils = S3Utils()
+
+    def _parse_filename(self, s3_key):
+        """
+        Parses an S3 object key to extract datetime and product information.
+        Assumes GK2A L1B file naming convention:
+        GK2_AMI_L1B_{AREA}{CHANNEL}_{YYYYMMDD}_{HHMMSS}.nc
+
+        Args:
+            s3_key (str): Full S3 object key (path to the .nc file).
+
+        Returns:
+            dict or None: A dictionary with 'datetime', 'area', 'product', and 's3_key',
+                          or None if parsing fails.
+        """
+        # Example: GKO/AMI/L1B/FD/2019/07/20/AMI_L1B_FD020_20190720_000000.nc
+        # Updated regex to correctly capture 'la' in filename like gk2a_ami_le1b_ir087_la020ge_202406151406.nc
+        match = re.search(r'AMI_L1B_([A-Za-z]{2,3})(\d{3}[A-Za-z]{0,2})_(\d{8})_(\d{6})\.nc$', s3_key)
+        if match:
+            area = match.group(1).lower()
+            # Channel code might include letters for local areas, e.g., '020ge'
+            channel_id = match.group(2)
+            date_str = match.group(3)
+            time_str = match.group(4)
+            try:
+                dt_obj = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+                return {
+                    "datetime": dt_obj,
+                    "area": area,
+                    "channel_id": channel_id, # Store channel_id to help infer product if needed
+                    "s3_key": s3_key,
+                }
+            except ValueError:
+                return None
+        return None
+
+    def _find_files(self, sensor, product, start_time, end_time, area):
+        """
+        Finds relevant files within a time range for a given product and area.
+        This method constructs the S3 prefix path based on year, month, day.
+        """
+        found_files = []
+        current_time = start_time
+        while current_time <= end_time:
+            # Construct S3 prefix for the specific day
+            daily_prefix = (
+                f"{GK2ADefs.get_product_prefix(sensor, product, area)}/"
+                f"{current_time.strftime('%Y/%m/%d')}/"
+            )
+            all_files_in_day = self.s3_utils.list_files(daily_prefix)
+
+            for s3_key in all_files_in_day:
+                file_info = self._parse_filename(s3_key)
+                if file_info and product in s3_key and area in s3_key: # Basic check
+                    if start_time <= file_info["datetime"] <= end_time:
+                        found_files.append(file_info)
+            current_time += timedelta(days=1)
+
+        # Sort files by datetime
+        found_files.sort(key=lambda x: x["datetime"])
+        return found_files
+
+    def _load_as_xarray(self, s3_path):
+        """
+        Loads a NetCDF4 file from S3 directly into an xarray.Dataset.
+        Uses s3fs for memory-efficient streaming.
+
+        Args:
+            s3_path (str): Full S3 path to the .nc file (e.g., "s3://bucket/key.nc").
+
+        Returns:
+            xarray.Dataset or None: The loaded dataset, or None if an error occurs.
+        """
+        try:
+            with self.s3_utils.s3_filesystem.open(s3_path, mode="rb") as f:
+                # Use h5netcdf engine for NetCDF4 files
+                ds = xr.open_dataset(f, engine="h5netcdf", chunks={})
+                return ds
+        except Exception as e:
+            print(f"Error loading {s3_path} into xarray: {e}")
+            traceback.print_exc()
+            return None
 
     def _calibrate(self, ds, product_name):
         """
@@ -177,7 +247,7 @@ class Gk2aDataFetcher:
             ds (xr.Dataset): The input dataset containing the raw pixel values
                              and necessary calibration coefficients as attributes.
             product_name (str): The product identifier (e.g., 'vi004', 'ir133')
-                                which determines the calibration path.
+                                 which determines the calibration path.
 
         Returns:
             xr.Dataset: The dataset with a new calibrated data variable
@@ -305,192 +375,172 @@ class Gk2aDataFetcher:
             print("Returning uncalibrated data.", file=sys.stderr)
             return ds
 
-
-    @staticmethod
-    def _generate_s3_prefixes(sensor, product, start_time, end_time, area=None):
+    def _add_geolocation(self, ds, area, resolution, sat_time_utc=None):
         """
-        Generates the S3 prefixes to search for files within a time range.
+        Adds latitude and longitude coordinates to the xarray.Dataset using the
+        geolocation module.
 
-        The GK-2A S3 bucket is organized by .../YYYYMM/DD/HH/. This method
-        iterates through each hour in the specified time range and yields the
-        corresponding S3 prefix.
+        Args:
+            ds (xarray.Dataset): The xarray dataset to add coordinates to.
+            area (str): The observation area (e.g., 'fd', 'la').
+            resolution (str): The resolution of the data (e.g., '0.5km', '1km', '2km').
+            sat_time_utc (datetime.datetime, optional): Satellite observation time in UTC.
+                                                       *Not used in current GEOS-only implementation for FD/LA*,
+                                                       but kept for consistency in function signature.
+
+        Returns:
+            xarray.Dataset: The dataset with 'latitude' and 'longitude' coordinates added.
+        """
+        # Determine the dimension names for columns and lines in the dataset.
+        data_var_name = list(ds.data_vars.keys())[0] # Get the first data variable
+
+        column_dim = None
+        line_dim = None
+
+        if 'x' in ds[data_var_name].dims and 'y' in ds[data_var_name].dims:
+            column_dim = 'x'
+            line_dim = 'y'
+        elif 'column' in ds[data_var_name].dims and 'line' in ds[data_var_name].dims:
+            column_dim = 'column'
+            line_dim = 'line'
+        elif len(ds[data_var_name].dims) >= 2: # Fallback for generic 2D data (last two dims are spatial)
+            line_dim = ds[data_var_name].dims[-2]
+            column_dim = ds[data_var_name].dims[-1]
+        else:
+            print(f"Warning: Could not identify suitable 2D dimensions for geolocation in data variable '{data_var_name}' (expected 'x'/'y' or 'column'/'line'). Skipping geolocation.")
+            return ds
+
+        columns = ds[column_dim].values
+        lines = ds[line_dim].values
+
+        # Create a meshgrid for all pixels to get all (column, line) pairs
+        cols_mesh, lines_mesh = np.meshgrid(columns, lines)
+
+        # Convert to lat/lon using the geolocation module
+        # Note: sat_time_utc is no longer directly used by `geolocation.to_latlon` for GEOS,
+        # but the parameter is kept in the signature for broader compatibility if needed.
+        latitudes, longitudes = geolocation.to_latlon(
+            cols_mesh, lines_mesh, area, resolution
+        )
+
+        # Add as new coordinates to the xarray dataset.
+        # Ensure the dimensions match the original data's spatial dimensions.
+        ds = ds.assign_coords(latitude=((line_dim, column_dim), latitudes))
+        ds = ds.assign_coords(longitude=((line_dim, column_dim), longitudes))
+
+        return ds
+
+    def get_data(self, sensor, product, area, query_type,
+                 target_time=None, start_time=None, end_time=None,
+                 calibrate=False, geolocation_enabled=False): # Added geolocation_enabled option
+        """
+        Fetches GK2A satellite data.
 
         Args:
             sensor (str): The sensor name (e.g., 'ami').
-            product (str): The product identifier (e.g., 'vi004').
-            start_time (datetime): The beginning of the time range.
-            end_time (datetime): The end of the time range.
-            area (str): The geographic area (e.g., 'fd', 'ela', 'la').
-
-        Yields:
-            str: An S3 prefix string for a specific hour.
-
-        Raises:
-            ValueError: If 'area' is not provided.
-        """
-        if not area:
-            raise ValueError("The 'area' parameter is required for L1B data.")
-        base_prefix = f"{sensor.upper()}/L1B/{area.upper()}/"
-        current_time = start_time
-        while current_time <= end_time:
-            time_path = current_time.strftime(f"%Y%m/%d/%H/")
-            filename_prefix = f"gk2a_{sensor.lower()}_le1b_{product.lower()}_{area.lower()}"
-            full_prefix = f"{base_prefix}{time_path}{filename_prefix}"
-            yield full_prefix
-            current_time += timedelta(hours=1)
-
-    def _find_files(self, sensor, product, start_time, end_time, area=None):
-        """
-        Finds all relevant data files within a specified time range.
-
-        This method queries S3 using the prefixes generated by
-        _generate_s3_prefixes, filters the results to match the exact time
-        window, parses the filenames, and returns a sorted list of file metadata.
-
-        Args:
-            sensor (str): The sensor name.
-            product (str): The product identifier.
-            start_time (datetime): The start of the time range.
-            end_time (datetime): The end of the time range.
-            area (str): The geographic area.
+            product (str): The data product name (e.g., 'ir105').
+            area (str): The observation area ('fd' or 'la').
+            query_type (str): Type of query: 'latest', 'nearest', 'range'.
+            target_time (datetime.datetime, optional): Target time for 'nearest' query.
+                                                      Required for 'nearest' query.
+            start_time (datetime.datetime, optional): Start time for 'range' query.
+                                                     Required for 'range' query.
+            end_time (datetime.datetime, optional): End time for 'range' query.
+                                                   Required for 'range' query.
+            calibrate (bool): If True, calibrate raw data to physical units.
+            geolocation_enabled (bool): If True, add latitude and longitude coordinates
+                                        to the dataset. Defaults to False.
 
         Returns:
-            list[dict]: A sorted list of dictionaries, where each dictionary
-                        contains parsed metadata for a found file. Returns an
-                        empty list if no files are found.
+            xarray.Dataset: The requested satellite data. Returns None if data not found
+                            or an error occurs.
         """
-        all_files = []
-        prefixes = list(self._generate_s3_prefixes(sensor, product, start_time, end_time, area))
-        for prefix in prefixes:
-            s3_objects = self.s3_utils.list_files_in_prefix(prefix)
-            for obj in s3_objects:
-                filename = os.path.basename(obj['Key'])
-                parsed_data = GK2ADefs.parse_filename(filename)
-                
-                if not parsed_data:
-                    continue
-                
-                file_time = parsed_data.get('datetime')
-                if not file_time:
-                    continue
-                    
-                # Final check to ensure file is within the precise time range.
-                if not (start_time <= file_time <= end_time):
-                    continue
+        if sensor.lower() != 'ami':
+            raise ValueError("Only 'ami' sensor is supported at this time.")
 
-                parsed_data['s3_key'] = obj['Key']
-                all_files.append(parsed_data)
+        # Validate requested area
+        if area.lower() not in ['fd', 'la']:
+            raise ValueError(f"Unsupported observation area: '{area}'. Must be 'fd' or 'la'.")
 
-        # Sort files chronologically.
-        all_files.sort(key=lambda x: x.get('datetime', datetime.min))
-        return all_files
-    
-    def _load_as_xarray(self, s3_path):
-        """
-        Loads a single NetCDF file from S3 into an xarray.Dataset.
+        # Determine resolution based on product for geolocation
+        resolution = GK2ADefs.get_resolution(product)
+        if resolution == 'unknown':
+            print(f"Warning: Unknown resolution for product '{product}'. Geolocation may not work correctly.")
 
-        Args:
-            s3_path (str): The full S3 path (e.g., 's3://bucket/key').
+        if query_type == 'latest':
+            today_prefix = (
+                f"{GK2ADefs.get_product_prefix(sensor, product, area)}/"
+                f"{datetime.utcnow().strftime('%Y/%m/%d')}/"
+            )
+            latest_file_info = self.s3_utils.get_latest_file(today_prefix)
 
-        Returns:
-            xr.Dataset: The loaded dataset. Returns None if loading fails.
-        """
-        try:
-            # Use the s3fs filesystem object to open a remote file handle.
-            remote_file = self.s3_utils.fs.open(s3_path, 'rb')
-            # Open the dataset with automatic chunking for Dask integration.
-            ds = xr.open_dataset(remote_file, chunks='auto')
-            return ds
-        except Exception as e:
-            print(f"ERROR: Could not open S3 object {s3_path} as xarray.Dataset: {e}", file=sys.stderr)
+            if latest_file_info:
+                parsed_info = self._parse_filename(latest_file_info['s3_key'])
+                if parsed_info:
+                    ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{parsed_info['s3_key']}")
+                    if ds:
+                        if calibrate:
+                            ds = self._calibrate(ds, product)
+                        if geolocation_enabled:
+                            # sat_time_utc is no longer used by GEOS projection, can pass None or actual time.
+                            ds = self._add_geolocation(ds, area, resolution, sat_time_utc=parsed_info['datetime'])
+                        return ds
+                print(f"Error parsing latest file info or loading data for {today_prefix}.")
+            else:
+                print(f"No latest file found for prefix: {today_prefix}")
             return None
 
-    def get_data(self, sensor, product, area, query_type='latest', target_time=None, start_time=None, end_time=None, calibrate=False):
-        """
-        Fetches GK-2A data based on specified criteria.
-
-        This is the main public method of the class. It provides three ways to
-        query for data: 'latest', 'nearest', and 'range'.
-
-        Args:
-            sensor (str): The sensor name, e.g., 'ami'.
-            product (str): The product identifier, e.g., 'vi004', 'ir133'.
-            area (str): The geographical area, e.g., 'fd' (Full Disk),
-                        'ela' (Extended Local Area), 'la' (Local Area).
-            query_type (str, optional): The type of query. One of 'latest',
-                'nearest', or 'range'. Defaults to 'latest'.
-            target_time (datetime, optional): The target time for a 'nearest'
-                query. Required if query_type is 'nearest'.
-            start_time (datetime, optional): The start time for a 'range'
-                query. Required if query_type is 'range'.
-            end_time (datetime, optional): The end time for a 'range'
-                query. Required if query_type is 'range'.
-            calibrate (bool, optional): If True, applies calibration to the
-                loaded data. Defaults to False.
-
-        Returns:
-            xr.Dataset or None: An xarray.Dataset containing the requested data.
-            The dataset will have a 'time' dimension. Returns None if no data
-            is found or if an error occurs.
-
-        Raises:
-            ValueError: If `query_type` is unknown or if required time
-                parameters for 'nearest' or 'range' queries are missing.
-        """
-        if query_type == 'latest':
-            # Search the last 2 hours for the most recent file.
-            search_end = datetime.utcnow()
-            search_start = search_end - timedelta(hours=2)
-            found_files = self._find_files(sensor, product, search_start, search_end, area)
-            if not found_files: return None
-            
-            latest_file = found_files[-1]
-            ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{latest_file['s3_key']}")
-            if not ds: return None
-            
-            if calibrate:
-                ds = self._calibrate(ds, product)
-            # Add a time dimension to the dataset for consistency.
-            return ds.expand_dims(time=[latest_file['datetime']])
-
         elif query_type == 'nearest':
-            if not target_time: raise ValueError("`target_time` is required for 'nearest' query.")
-            # Search a 4-hour window around the target time.
-            search_start = target_time - timedelta(hours=2)
-            search_end = target_time + timedelta(hours=2)
-            found_files = self._find_files(sensor, product, search_start, search_end, area)
-            if not found_files: return None
+            if not target_time:
+                raise ValueError("`target_time` is required for 'nearest' query.")
 
-            # Find the file with the minimum time difference from the target.
-            nearest_file = min(found_files, key=lambda x: abs(x['datetime'] - target_time))
-            ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{nearest_file['s3_key']}")
-            if not ds: return None
-            
-            if calibrate:
-                ds = self._calibrate(ds, product)
-            return ds.expand_dims(time=[nearest_file['datetime']])
+            search_start_time = target_time - timedelta(days=1)
+            search_end_time = target_time + timedelta(days=1)
+            found_files = self._find_files(sensor, product, search_start_time, search_end_time, area)
+
+            if not found_files:
+                print(f"No files found near {target_time} for product {product}, area {area}.")
+                return None
+
+            nearest_file_info = min(found_files, key=lambda x: abs(x["datetime"] - target_time))
+
+            ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{nearest_file_info['s3_key']}")
+            if ds:
+                if calibrate:
+                    ds = self._calibrate(ds, product)
+                if geolocation_enabled:
+                    # sat_time_utc is no longer used by GEOS projection, can pass None or actual time.
+                    ds = self._add_geolocation(ds, area, resolution, sat_time_utc=nearest_file_info['datetime'])
+                return ds.expand_dims(time=[nearest_file_info['datetime']])
+            return None
 
         elif query_type == 'range':
-            if not start_time or not end_time: raise ValueError("`start_time` and `end_time` are required for 'range' query.")
+            if not start_time or not end_time:
+                raise ValueError("`start_time` and `end_time` are required for 'range' query.")
+
             found_files = self._find_files(sensor, product, start_time, end_time, area)
-            if not found_files: return None
+            if not found_files:
+                print(f"No files found in range {start_time} to {end_time} for product {product}, area {area}.")
+                return None
 
             datasets = []
             for file_info in found_files:
                 ds = self._load_as_xarray(f"s3://{GK2ADefs.S3_BUCKET}/{file_info['s3_key']}")
                 if ds:
-                    # To ensure concatenation works, we might need to handle datasets
-                    # with multiple variables. Here we simplify by just taking the main one.
-                    # A more robust implementation might select variables explicitly.
-                    main_var = next(iter(ds.data_vars))
-                    ds_clean = ds[[main_var]]
+                    main_var = list(ds.data_vars.keys())[0]
+                    ds_processed = ds[[main_var]]
+                    ds_processed[main_var].attrs = ds[main_var].attrs
+
                     if calibrate:
-                        ds_clean = self._calibrate(ds, product)
-                    # Add time dimension before appending for concatenation.
-                    datasets.append(ds_clean.expand_dims(time=[file_info['datetime']]))
-            
-            if not datasets: return None
-            # Combine all individual datasets into a single timeseries dataset.
+                        ds_processed = self._calibrate(ds_processed, product)
+                    if geolocation_enabled:
+                        # sat_time_utc is no longer used by GEOS projection, can pass None or actual time.
+                        ds_processed = self._add_geolocation(ds_processed, area, resolution, sat_time_utc=file_info['datetime'])
+
+                    datasets.append(ds_processed.expand_dims(time=[file_info['datetime']]))
+
+            if not datasets:
+                return None
             return xr.concat(datasets, dim='time')
 
         else:
