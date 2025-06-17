@@ -179,10 +179,22 @@ class GK2ADefs:
 
     # GK2A sensor (AMI) product types and areas
     AMI_PRODUCTS = [
-        'vis004', 'vis005', 'vis006', 'vis008',
-        'ir013', 'ir039', 'ir050', 'ir062', 'ir069',
-        'ir073', 'ir087', 'ir096', 'ir104', 'ir112',
-        'ir120', 'ir133'
+        'vi004',
+        'vi005',
+        'vi006',
+        'vi008',
+        'nr013',
+        'nr016',
+        'sw038',
+        'wv063',
+        'wv069',
+        'wv073',
+        'ir087',
+        'ir096',
+        'ir105',
+        'ir112',
+        'ir123',
+        'ir133',
     ]
     AMI_AREAS = ['fd', 'la']
 
@@ -281,6 +293,8 @@ class Gk2aDataFetcher:
         Constructs the S3 prefix path based on sensor, area, product, and optional datetime.
         Now follows YYYYMM/DD/HH structure.
         """
+        # //noaa-gk2a-pds/AMI/L1B/FD/202506/17/16/
+        # gk2a_ami_le1b_ir087_fd020ge_202506171650.nc
         base_prefix = f"{sensor.upper()}/L1B/{area.upper()}"
         if dt:
             # Construct path as L1B/{AREA}/{YYYYMM}/{DD}/{HH}/
