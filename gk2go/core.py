@@ -399,7 +399,7 @@ class Gk2aDataFetcher:
                 print(f"Loading data from: {s3_path}", file=sys.stderr)
               
             # Use the s3fs filesystem object to open a remote file handle.
-            remote_file = self.s3_utils.fs.open(s3_path, 'rb')
+            remote_file = self.s3_utils.s3_fs.open(s3_path, 'rb')
             # Open the dataset with automatic chunking for Dask integration.
             ds = xr.open_dataset(remote_file, chunks='auto')
             return ds
