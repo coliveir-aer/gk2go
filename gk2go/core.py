@@ -281,7 +281,7 @@ class Gk2aDataFetcher:
         Constructs the S3 prefix path based on sensor, area, product, and optional datetime.
         Now follows YYYYMM/DD/HH structure.
         """
-        base_prefix = f"{sensor}.upper()/L1B/{area.upper()}"
+        base_prefix = f"{sensor.upper()}/L1B/{area.upper()}"
         if dt:
             # Construct path as L1B/{AREA}/{YYYYMM}/{DD}/{HH}/
             return f"{base_prefix}/{dt.strftime('%Y%m')}/{dt.strftime('%d')}/{dt.strftime('%H')}/"
