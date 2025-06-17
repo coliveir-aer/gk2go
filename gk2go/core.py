@@ -369,7 +369,7 @@ class Gk2aDataFetcher:
         all_files = []
         prefixes = list(self._generate_s3_prefixes(sensor, product, start_time, end_time, area))
         for prefix in prefixes:
-            s3_objects = self.s3_utils.list_files_in_prefix(prefix)
+            s3_objects = self.s3_utils.list_s3_objects(prefix)
             for obj in s3_objects:
                 filename = os.path.basename(obj['Key'])
                 parsed_data = GK2ADefs.parse_filename(filename)
