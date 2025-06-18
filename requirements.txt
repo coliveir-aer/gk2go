@@ -1,0 +1,7 @@
+boto3
+xarray
+h5netcdf
+dask
+s3fs
+matplotlib
+numpy
