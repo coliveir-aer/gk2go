@@ -73,6 +73,15 @@ class S3Utils:
         pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
         return [obj["Key"] for page in pages if "Contents" in page for obj in page["Contents"]]
 
+    def download_file(self, bucket, key, local_path):
+        """Downloads a file from S3 to a local path."""
+        try:
+            self.s3_client.download_file(bucket, key, local_path)
+            return True
+        except Exception as e:
+            print(f"Error downloading {key} from S3: {e}", file=sys.stderr)
+            return False
+
 class Gk2aDataFetcher:
     """The main interface for fetching and processing GK-2A L1B data."""
     def __init__(self):
@@ -96,6 +105,7 @@ class Gk2aDataFetcher:
         return all_files
 
     def _load_as_xarray(self, s3_path, debug=False):
+        """Loads a NetCDF file from S3 into an xarray.Dataset."""
         try:
             if debug: print(f"Loading data from: {s3_path}")
             remote_file = self.s3_utils.s3_fs.open(s3_path, 'rb')
@@ -106,6 +116,7 @@ class Gk2aDataFetcher:
             return None
 
     def _calibrate(self, ds, product_name, debug=False):
+        """Performs radiometric calibration on the xarray dataset."""
         if debug: print(f"--- Calibrating {product_name} ---")
         try:
             pixel_da = ds['image_pixel_values']
@@ -141,8 +152,46 @@ class Gk2aDataFetcher:
             print(f"CALIBRATION FAILED: {e}", file=sys.stderr)
             return ds
 
+    def _save_dataset(self, ds, local_path, debug=False):
+        """Saves an xarray dataset to a NetCDF file."""
+        try:
+            if debug: print(f"Saving dataset to: {local_path}")
+            ds.to_netcdf(local_path)
+            return True
+        except Exception as e:
+            print(f"Error saving dataset to {local_path}: {e}", file=sys.stderr)
+            return False
+
     def get_data(self, sensor, product, area, query_type, target_time=None,
-                 start_time=None, end_time=None, calibrate=True, debug=False):
+                 start_time=None, end_time=None, calibrate=True,
+                 download_raw=False, save_calibrated=False, load_xarray=True,
+                 debug=False):
+        """
+        Fetches and processes GK-2A L1B data.
+
+        Args:
+            sensor (str): The satellite sensor (e.g., 'ami').
+            product (str): The data product (e.g., 'vi008').
+            area (str): The geographical area (e.g., 'fd' for full disk).
+            query_type (str): Type of query: 'latest', 'nearest', or 'range'.
+            target_time (datetime, optional): Required for 'nearest' query.
+            start_time (datetime, optional): Required for 'range' query.
+            end_time (datetime, optional): Required for 'range' query.
+            calibrate (bool): Whether to perform radiometric calibration. Defaults to True.
+            download_raw (bool): If True, downloads the raw NetCDF file. Defaults to False.
+            save_calibrated (bool): If True, saves the calibrated dataset as NetCDF. Defaults to False.
+            load_xarray (bool): If True, loads data into an xarray.Dataset. Defaults to True.
+            debug (bool): If True, prints debugging information. Defaults to False.
+
+        Returns:
+            xr.Dataset or None: The processed xarray dataset, or None if no data found.
+        """
+        
+        # Validate input flags
+        if not load_xarray and calibrate:
+            print("ERROR: Calibration cannot occur unless data is loaded into xarray. "
+                  "Please set 'load_xarray' to True if you want to calibrate.", file=sys.stderr)
+            return None
         
         found_files = []
         if query_type == 'latest':
@@ -162,7 +211,21 @@ class Gk2aDataFetcher:
 
         datasets = []
         for file_info in found_files:
-            ds = self._load_as_xarray(f"s3://{self.s3_bucket}/{file_info['s3_key']}", debug=debug)
+            s3_full_path = f"s3://{self.s3_bucket}/{file_info['s3_key']}"
+            local_raw_path = os.path.basename(file_info['s3_key'])
+            
+            # Handle download_raw flag
+            if download_raw:
+                print(f"Downloading raw file: {local_raw_path}")
+                if not self.s3_utils.download_file(self.s3_bucket, file_info['s3_key'], local_raw_path):
+                    print(f"Failed to download raw file: {local_raw_path}", file=sys.stderr)
+            
+            if not load_xarray:
+                # If we are not loading into xarray, and only want to confirm existence or download raw
+                print(f"File exists: {s3_full_path}. Not loading into xarray as requested.")
+                continue # Move to the next file if multiple found, or finish if only one.
+
+            ds = self._load_as_xarray(s3_full_path, debug=debug)
             if ds is None: continue
 
             if product in GK2ADefs.HIGH_RES_PRODUCTS:
@@ -179,7 +242,18 @@ class Gk2aDataFetcher:
             
             ds = ds.expand_dims(time=[file_info['datetime']])
             datasets.append(ds)
+
+            # Handle save_calibrated flag
+            if save_calibrated:
+                calibrated_filename = f"calibrated_{os.path.basename(file_info['s3_key'])}"
+                if not self._save_dataset(ds, calibrated_filename, debug=debug):
+                    print(f"Failed to save calibrated dataset: {calibrated_filename}", file=sys.stderr)
         
-        if not datasets: return None
+        if not datasets:
+            if not load_xarray and (download_raw or not download_raw): # If no datasets were loaded because load_xarray was False
+                return None # Or a more appropriate return for this case if needed
+            print(f"No datasets processed for the query with current flags.")
+            return None
+        
         return xr.concat(datasets, dim='time') if len(datasets) > 1 else datasets[0]
 
