@@ -197,8 +197,8 @@ class Gk2aDataFetcher:
                   "Please set 'load_xarray' to True if you want to calibrate.", file=sys.stderr)
             return None
         
-        # Ensure download directory exists if download is requested or calibrated data is to be saved
-        if (download or save_calibrated) and download_dir:
+        # Ensure download directory exists
+        if download_dir and download:
             os.makedirs(download_dir, exist_ok=True)
 
         found_files = []
@@ -223,85 +223,58 @@ class Gk2aDataFetcher:
             local_raw_filename = os.path.basename(file_info['s3_key'])
             local_raw_path = os.path.join(download_dir, local_raw_filename) if download_dir else local_raw_filename
             
-            current_ds = None
-            source_to_load_path = None # Path from which xarray should attempt to load
-
-            # 1. Check for local file existence
+            ds = None
             if os.path.exists(local_raw_path):
-                print(f"File already exists locally: {local_raw_path}.")
-                # If file exists locally, it's the primary source for loading if load_xarray is True
-                source_to_load_path = local_raw_path
+                print(f"File already exists locally: {local_raw_path}. Loading from local disk.")
+                if load_xarray:
+                    ds = self._load_as_xarray(local_raw_path, debug=debug)
             elif download:
-                # 2. Attempt to download if not local and download flag is True
-                print(f"Attempting to download file to: {local_raw_path}")
+                print(f"Downloading file to: {local_raw_path}")
                 if self.s3_utils.download_file(self.s3_bucket, file_info['s3_key'], local_raw_path):
-                    print(f"Successfully downloaded {local_raw_filename}.")
-                    source_to_load_path = local_raw_path
+                    if load_xarray:
+                        ds = self._load_as_xarray(local_raw_path, debug=debug)
                 else:
-                    print(f"Failed to download {local_raw_filename}.", file=sys.stderr)
-                    # If download failed, source_to_load_path remains None, will fall back to S3 direct load if load_xarray is True.
+                    print(f"Failed to download raw file: {local_raw_path}", file=sys.stderr)
             else:
-                # 3. If not local and download is False, just confirm S3 existence.
-                # If load_xarray is also False, we skip loading and processing.
-                # If load_xarray is True, we'll proceed to attempt direct S3 load.
-                print(f"File not found locally and download is False. Confirming existence on S3: {s3_full_path}")
-                source_to_load_path = s3_full_path # Set S3 path as source if no local file and no download requested
+                # If not downloading and not exists locally, just confirm existence in S3
+                print(f"File exists on S3: {s3_full_path}. Not downloading or loading into xarray as requested.")
+                continue # Move to the next file or finish
 
-            # Now, handle loading into xarray based on determined source_to_load_path and load_xarray flag
-            if load_xarray:
-                if source_to_load_path:
-                    current_ds = self._load_as_xarray(source_to_load_path, debug=debug)
-                else:
-                    # This case should ideally not be reached if source_to_load_path is correctly set
-                    # (e.g., if download failed but load_xarray is True, it should fallback to S3_full_path)
-                    print(f"No local path or successful download. Attempting to load from S3 directly: {s3_full_path}")
-                    current_ds = self._load_as_xarray(s3_full_path, debug=debug)
-                
-                if current_ds is None:
-                    print(f"Failed to load xarray dataset for {local_raw_filename} from any source. Skipping this file.", file=sys.stderr)
-                    continue # Skip to next file if loading completely failed
-            elif not download and not os.path.exists(local_raw_path):
-                # If load_xarray is False, download is False, and file is not local,
-                # it means we only needed to confirm existence. So, skip further processing for this file.
-                continue
+            if ds is None and load_xarray: # If loading into xarray was requested but failed or didn't happen from local/downloaded
+                # Fallback to S3 direct load if loading was requested but no local file was loaded
+                print(f"Attempting to load from S3 directly: {s3_full_path}")
+                ds = self._load_as_xarray(s3_full_path, debug=debug)
             
-            # If current_ds is None here, it implies load_xarray was False and we either
-            # successfully handled a download, or confirmed local existence without loading.
-            # In these cases, we do not have a dataset to process, so we continue.
-            if current_ds is None:
+            if ds is None: # If after all attempts, ds is still None, skip this file
                 continue
 
-            # --- Proceed with dataset processing if current_ds is not None ---
             if product in GK2ADefs.HIGH_RES_PRODUCTS:
-                dims = current_ds['image_pixel_values'].dims
-                original_height = len(current_ds[dims[0]])
+                dims = ds['image_pixel_values'].dims
+                original_height = len(ds[dims[0]])
                 if original_height > 5500:
                     factor = original_height // 5500
                     if debug: print(f"Decimating high-res imagery (factor {factor}) to 2km grid.")
                     coarsen_dims = {dims[0]: factor, dims[1]: factor}
-                    current_ds = current_ds.coarsen(coarsen_dims, boundary="trim").mean()
+                    ds = ds.coarsen(coarsen_dims, boundary="trim").mean()
             
             if calibrate:
-                current_ds = self._calibrate(current_ds, product, debug=debug)
+                ds = self._calibrate(ds, product, debug=debug)
             
-            current_ds = current_ds.expand_dims(time=[file_info['datetime']])
-            datasets.append(current_ds)
+            ds = ds.expand_dims(time=[file_info['datetime']])
+            datasets.append(ds)
 
             # Handle save_calibrated flag
             if save_calibrated:
                 calibrated_filename = f"calibrated_{local_raw_filename}"
                 calibrated_filepath = os.path.join(download_dir, calibrated_filename) if download_dir else calibrated_filename
-                if not self._save_dataset(current_ds, calibrated_filepath, debug=debug):
+                if not self._save_dataset(ds, calibrated_filepath, debug=debug):
                     print(f"Failed to save calibrated dataset: {calibrated_filepath}", file=sys.stderr)
         
-        # Final check for datasets collected
         if not datasets:
-            if load_xarray: # If xarray loading was expected but no datasets were collected
-                print(f"No datasets were successfully loaded and processed for the query with current flags.")
-            elif not download: # If load_xarray is False and download is False (just existence check for all files)
-                print(f"No datasets were processed. File existence confirmed for all applicable files.")
-            else: # load_xarray is False, download is True, but no files were processed (e.g., all downloads failed)
-                print(f"Attempted downloads, but no datasets were processed for the query with current flags.")
+            if not load_xarray and not download: # if no datasets were loaded and no download was requested, just confirm existence.
+                print(f"No datasets processed for the query with current flags. File existence was confirmed where applicable.")
+            else:
+                print(f"No datasets processed for the query with current flags.")
             return None
         
         return xr.concat(datasets, dim='time') if len(datasets) > 1 else datasets[0]
