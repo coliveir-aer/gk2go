@@ -73,15 +73,6 @@ class S3Utils:
         pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
         return [obj["Key"] for page in pages if "Contents" in page for obj in page["Contents"]]
 
-    def download_file(self, bucket, key, local_path):
-        """Downloads a file from S3 to a local path."""
-        try:
-            self.s3_client.download_file(bucket, key, local_path)
-            return True
-        except Exception as e:
-            print(f"Error downloading {key} from S3: {e}", file=sys.stderr)
-            return False
-
 class Gk2aDataFetcher:
     """The main interface for fetching and processing GK-2A L1B data."""
     def __init__(self):
@@ -104,22 +95,17 @@ class Gk2aDataFetcher:
         all_files.sort(key=lambda x: x['datetime'])
         return all_files
 
-    def _load_as_xarray(self, path, debug=False):
-        """Loads a NetCDF file into an xarray.Dataset from a local path or S3."""
+    def _load_as_xarray(self, s3_path, debug=False):
         try:
-            if debug: print(f"Loading data from: {path}")
-            if path.startswith("s3://"):
-                remote_file = self.s3_utils.s3_fs.open(path, 'rb')
-                return xr.open_dataset(remote_file, engine='h5netcdf', chunks='auto')
-            else:
-                return xr.open_dataset(path, engine='h5netcdf', chunks='auto')
+            if debug: print(f"Loading data from: {s3_path}")
+            remote_file = self.s3_utils.s3_fs.open(s3_path, 'rb')
+            return xr.open_dataset(remote_file, engine='h5netcdf', chunks='auto')
         except Exception as e:
-            print(f"Error loading xarray dataset from {path}: {e}", file=sys.stderr)
+            print(f"Error loading xarray dataset: {e}", file=sys.stderr)
             if debug: traceback.print_exc()
             return None
 
     def _calibrate(self, ds, product_name, debug=False):
-        """Performs radiometric calibration on the xarray dataset."""
         if debug: print(f"--- Calibrating {product_name} ---")
         try:
             pixel_da = ds['image_pixel_values']
@@ -155,52 +141,9 @@ class Gk2aDataFetcher:
             print(f"CALIBRATION FAILED: {e}", file=sys.stderr)
             return ds
 
-    def _save_dataset(self, ds, local_path, debug=False):
-        """Saves an xarray dataset to a NetCDF file."""
-        try:
-            if debug: print(f"Saving dataset to: {local_path}")
-            ds.to_netcdf(local_path)
-            return True
-        except Exception as e:
-            print(f"Error saving dataset to {local_path}: {e}", file=sys.stderr)
-            return False
-
     def get_data(self, sensor, product, area, query_type, target_time=None,
-                 start_time=None, end_time=None, calibrate=True,
-                 download=False, save_calibrated=False, load_xarray=True,
-                 download_dir='.', debug=False):
-        """
-        Fetches and processes GK-2A L1B data.
-
-        Args:
-            sensor (str): The satellite sensor (e.g., 'ami').
-            product (str): The data product (e.g., 'vi008').
-            area (str): The geographical area (e.g., 'fd' for full disk).
-            query_type (str): Type of query: 'latest', 'nearest', or 'range'.
-            target_time (datetime, optional): Required for 'nearest' query.
-            start_time (datetime, optional): Required for 'range' query.
-            end_time (datetime, optional): Required for 'range' query.
-            calibrate (bool): Whether to perform radiometric calibration. Defaults to True.
-            download (bool): If True, downloads the NetCDF file to `download_dir`. Defaults to False.
-            save_calibrated (bool): If True, saves the calibrated dataset as NetCDF. Defaults to False.
-            load_xarray (bool): If True, loads data into an xarray.Dataset. Defaults to True.
-            download_dir (str): Directory to download raw files to. Defaults to current directory.
-            debug (bool): If True, prints debugging information. Defaults to False.
-
-        Returns:
-            xr.Dataset or None: The processed xarray dataset, or None if no data found.
-        """
+                 start_time=None, end_time=None, calibrate=True, debug=False):
         
-        # Validate input flags
-        if not load_xarray and calibrate:
-            print("ERROR: Calibration cannot occur unless data is loaded into xarray. "
-                  "Please set 'load_xarray' to True if you want to calibrate.", file=sys.stderr)
-            return None
-        
-        # Ensure download directory exists
-        if download_dir and download:
-            os.makedirs(download_dir, exist_ok=True)
-
         found_files = []
         if query_type == 'latest':
             found_files = self._find_files(sensor, product, datetime.utcnow() - timedelta(hours=24), datetime.utcnow(), area)
@@ -219,34 +162,8 @@ class Gk2aDataFetcher:
 
         datasets = []
         for file_info in found_files:
-            s3_full_path = f"s3://{self.s3_bucket}/{file_info['s3_key']}"
-            local_raw_filename = os.path.basename(file_info['s3_key'])
-            local_raw_path = os.path.join(download_dir, local_raw_filename) if download_dir else local_raw_filename
-            
-            ds = None
-            if os.path.exists(local_raw_path):
-                print(f"File already exists locally: {local_raw_path}. Loading from local disk.")
-                if load_xarray:
-                    ds = self._load_as_xarray(local_raw_path, debug=debug)
-            elif download:
-                print(f"Downloading file to: {local_raw_path}")
-                if self.s3_utils.download_file(self.s3_bucket, file_info['s3_key'], local_raw_path):
-                    if load_xarray:
-                        ds = self._load_as_xarray(local_raw_path, debug=debug)
-                else:
-                    print(f"Failed to download raw file: {local_raw_path}", file=sys.stderr)
-            else:
-                # If not downloading and not exists locally, just confirm existence in S3
-                print(f"File exists on S3: {s3_full_path}. Not downloading or loading into xarray as requested.")
-                continue # Move to the next file or finish
-
-            if ds is None and load_xarray: # If loading into xarray was requested but failed or didn't happen from local/downloaded
-                # Fallback to S3 direct load if loading was requested but no local file was loaded
-                print(f"Attempting to load from S3 directly: {s3_full_path}")
-                ds = self._load_as_xarray(s3_full_path, debug=debug)
-            
-            if ds is None: # If after all attempts, ds is still None, skip this file
-                continue
+            ds = self._load_as_xarray(f"s3://{self.s3_bucket}/{file_info['s3_key']}", debug=debug)
+            if ds is None: continue
 
             if product in GK2ADefs.HIGH_RES_PRODUCTS:
                 dims = ds['image_pixel_values'].dims
@@ -262,20 +179,7 @@ class Gk2aDataFetcher:
             
             ds = ds.expand_dims(time=[file_info['datetime']])
             datasets.append(ds)
-
-            # Handle save_calibrated flag
-            if save_calibrated:
-                calibrated_filename = f"calibrated_{local_raw_filename}"
-                calibrated_filepath = os.path.join(download_dir, calibrated_filename) if download_dir else calibrated_filename
-                if not self._save_dataset(ds, calibrated_filepath, debug=debug):
-                    print(f"Failed to save calibrated dataset: {calibrated_filepath}", file=sys.stderr)
         
-        if not datasets:
-            if not load_xarray and not download: # if no datasets were loaded and no download was requested, just confirm existence.
-                print(f"No datasets processed for the query with current flags. File existence was confirmed where applicable.")
-            else:
-                print(f"No datasets processed for the query with current flags.")
-            return None
-        
+        if not datasets: return None
         return xr.concat(datasets, dim='time') if len(datasets) > 1 else datasets[0]
 
